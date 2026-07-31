@@ -142,6 +142,10 @@ class RuntimeConfig:
     download_workers: int = 4
     device: str = "cuda"
     keep_models_loaded: bool = True
+    # Delete each video's raw download and working WAVs once it is finished.
+    # A long run otherwise accumulates roughly 0.5 GB per hour of source audio
+    # in .work/ on top of the dataset itself.
+    keep_intermediates: bool = False
 
 
 @dataclass

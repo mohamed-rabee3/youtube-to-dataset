@@ -16,6 +16,30 @@ yt2ds report dataset/ --link-speakers
 Playlist and channel URLs are expanded automatically, so a whole podcast series
 is one argument.
 
+## Many videos, one dataset
+
+Videos are processed **strictly one at a time**, and each one is written into
+the dataset the moment it finishes. Point a later run at the same `--out` and it
+adds to what is already there:
+
+```bash
+yt2ds run URL1 URL2 --out dataset/     # builds the dataset
+yt2ds run URL3     --out dataset/      # appends; URL1 and URL2 are not touched
+```
+
+Finished videos are recognised **from the URL alone**, so re-running a
+200-link file after adding one new link costs one download, not 201. Because
+each video is emitted as it completes, killing a long run keeps everything
+processed so far — `metadata.jsonl`, `manifest.json` and the WAVs are all
+consistent at every point. Restart it and it picks up at the first unfinished
+video.
+
+Downloading runs a few videos ahead of processing so the GPU is never waiting
+on the network, but never further: `--workers 1` keeps exactly one download in
+flight. Each video's raw download and working WAVs are deleted once it is
+complete (about 0.5 GB per source hour), so a hundred-video run does not fill
+the disk with intermediates. `--keep-intermediates` turns that off.
+
 ## What it does
 
 ```
@@ -136,7 +160,9 @@ behind the keep/drop decision (`squim_mos`, `squim_stoi`, `squim_pesq`,
 Runs are resumable: finished videos are skipped on a re-run, and adding a URL
 to an existing dataset only processes the new video. A video interrupted
 mid-write has its partial rows cleared before it is reprocessed, so
-`metadata.jsonl` never accumulates duplicates.
+`metadata.jsonl` never accumulates duplicates. `.work/` holds only the state
+and speaker centroids once a video is done — the bulky decodes are cleaned up
+as the run goes.
 
 ## Quality gates
 

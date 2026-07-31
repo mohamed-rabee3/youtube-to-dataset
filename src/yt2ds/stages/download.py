@@ -57,6 +57,33 @@ def _match_lang(available: list[str], patterns: list[str]) -> str | None:
     return None
 
 
+def video_id_from_url(url: str) -> str | None:
+    """Extract a video id from a URL without touching the network.
+
+    Used to answer "have I already done this one?" before paying for a probe
+    and a download, so re-running a long list only works on what is new.
+    Returns None for anything unrecognised, in which case the caller falls
+    back to downloading and checking the id yt-dlp reports.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host == "youtu.be":
+        candidate = parsed.path.lstrip("/").split("/")[0]
+        return candidate or None
+    if host not in ("youtube.com", "music.youtube.com", "youtube-nocookie.com"):
+        return None
+    if parsed.path == "/watch":
+        values = parse_qs(parsed.query).get("v")
+        return values[0] if values else None
+    for prefix in ("/shorts/", "/embed/", "/live/", "/v/"):
+        if parsed.path.startswith(prefix):
+            candidate = parsed.path[len(prefix) :].split("/")[0]
+            return candidate or None
+    return None
+
+
 def probe(url: str, cfg: Config) -> dict[str, Any] | None:
     """Fetch metadata for a single video without downloading media."""
     import yt_dlp

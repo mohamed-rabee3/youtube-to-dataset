@@ -59,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workers", type=int, help="parallel downloads")
     run.add_argument("--device", help="cuda | cuda:1 | cpu")
     run.add_argument("--no-resume", action="store_true", help="reprocess videos already finished")
+    run.add_argument(
+        "--keep-intermediates",
+        action="store_true",
+        help="keep each video's raw download and working WAVs (~0.5 GB per source hour)",
+    )
 
     # Common threshold overrides, so tuning does not require editing YAML.
     run.add_argument("--min-mos", type=float, help="minimum SQUIM MOS")
@@ -113,6 +118,8 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
     }
     if args.keep_overlap:
         mapping["diarize.drop_overlap"] = False
+    if args.keep_intermediates:
+        mapping["runtime.keep_intermediates"] = True
     if getattr(args, "languages", None):
         mapping["asr.languages"] = [lang.strip() for lang in args.languages.split(",") if lang.strip()]
     return {k: v for k, v in mapping.items() if v is not None}

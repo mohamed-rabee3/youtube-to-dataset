@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -61,41 +62,97 @@ class Pipeline:
     # ------------------------------------------------------------------
     def run(self, urls: list[str], resume: bool = True) -> list[VideoResult]:
         video_urls = download.expand_urls(urls, self.cfg)
-        log.info("%d video(s) to process", len(video_urls))
         if not video_urls:
+            log.info("no videos to process")
             return []
 
-        # Downloads are network-bound, so they overlap; everything after is
-        # GPU-bound and runs one video at a time.
-        assets = self._download_all(video_urls, resume)
-
         results: list[VideoResult] = []
-        for asset in assets:
-            if asset is None:
+        pending: list[str] = []
+        for url in video_urls:
+            video_id = download.video_id_from_url(url)
+            if resume and video_id and self.ws.is_complete(video_id):
+                results.append(self._already_done(video_id, url))
+            else:
+                pending.append(url)
+
+        done = len(results)
+        if done:
+            log.info("%d video(s): %d already complete, %d to process", len(video_urls), done, len(pending))
+        else:
+            log.info("%d video(s) to process", len(video_urls))
+
+        # One video is processed start to finish before the next begins, so
+        # each one lands in the dataset as it completes rather than at the end
+        # of the run. Downloads run a little ahead so the GPU is not left
+        # waiting on the network.
+        for position, (url, assets) in enumerate(self._stream_downloads(pending), start=1):
+            if assets is None:
+                results.append(
+                    VideoResult(
+                        video_id=download.video_id_from_url(url) or "unknown",
+                        url=url,
+                        error="download failed",
+                    )
+                )
                 continue
+
+            log.info("[%d/%d] %s -- %s", position, len(pending), assets.video_id, assets.title or url)
             try:
-                results.append(self._process(asset, resume))
+                results.append(self._process(assets, resume))
             except Exception as exc:  # noqa: BLE001 - one bad video must not stop the run
-                log.exception("failed processing %s", asset.video_id)
-                results.append(VideoResult(video_id=asset.video_id, url=asset.url, error=str(exc)))
+                log.exception("failed processing %s", assets.video_id)
+                results.append(VideoResult(video_id=assets.video_id, url=assets.url, error=str(exc)))
+            # The manifest is rewritten after every video, so a run that is
+            # interrupted still describes what it managed to finish.
+            self._write_manifest(results)
 
         self._write_manifest(results)
         return results
 
+    def _already_done(self, video_id: str, url: str) -> VideoResult:
+        """Rebuild a result from saved state, without downloading anything."""
+        state = self.ws.load_state(video_id)
+        log.info("%s: already complete, skipping", video_id)
+        return VideoResult(
+            video_id=video_id,
+            url=state.get("url") or url,
+            kept=state.get("kept", 0),
+            rejected=state.get("rejected", 0),
+            seconds_kept=state.get("seconds_kept", 0.0),
+            speakers=state.get("speakers", {}),
+            reasons=state.get("reasons", {}),
+            skipped=True,
+        )
+
     # ------------------------------------------------------------------
-    def _download_all(self, urls: list[str], resume: bool) -> list[download.VideoAssets | None]:
-        pending: list[str] = []
-        for url in urls:
-            pending.append(url)
+    def _stream_downloads(self, urls: list[str]) -> Iterator[tuple[str, download.VideoAssets | None]]:
+        """Yield each video as its download finishes, in the order given.
 
-        workers = max(1, self.cfg.runtime.download_workers)
-        out: list[download.VideoAssets | None] = []
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for asset in pool.map(lambda u: self._download_one(u, resume), pending):
-                out.append(asset)
-        return out
+        Downloading the whole list up front would mean a long silence before
+        any video is processed, every raw file on disk at once, and nothing to
+        show for it if the run is interrupted. Instead only a bounded
+        look-ahead is in flight: the network stays busy during GPU work without
+        running arbitrarily far ahead of it.
+        """
+        if not urls:
+            return
 
-    def _download_one(self, url: str, resume: bool) -> download.VideoAssets | None:
+        lookahead = max(1, self.cfg.runtime.download_workers)
+        with ThreadPoolExecutor(max_workers=lookahead) as pool:
+            queued: deque[tuple[str, Future[download.VideoAssets | None]]] = deque()
+            next_index = 0
+            while next_index < len(urls) and len(queued) < lookahead:
+                queued.append((urls[next_index], pool.submit(self._download_one, urls[next_index])))
+                next_index += 1
+
+            while queued:
+                url, future = queued.popleft()
+                if next_index < len(urls):
+                    queued.append((urls[next_index], pool.submit(self._download_one, urls[next_index])))
+                    next_index += 1
+                yield url, future.result()
+
+    def _download_one(self, url: str) -> download.VideoAssets | None:
         try:
             assets = download.download(url, self.ws, self.cfg)
         except Exception as exc:  # noqa: BLE001
@@ -110,16 +167,10 @@ class Pipeline:
     def _process(self, assets: download.VideoAssets, resume: bool) -> VideoResult:
         result = VideoResult(video_id=assets.video_id, url=assets.url)
 
+        # Normally caught before the download, but a URL whose id could not be
+        # parsed only reveals it here.
         if resume and self.ws.is_complete(assets.video_id):
-            log.info("%s: already complete, skipping", assets.video_id)
-            state = self.ws.load_state(assets.video_id)
-            result.kept = state.get("kept", 0)
-            result.rejected = state.get("rejected", 0)
-            result.seconds_kept = state.get("seconds_kept", 0.0)
-            result.speakers = state.get("speakers", {})
-            result.reasons = state.get("reasons", {})
-            result.skipped = True
-            return result
+            return self._already_done(assets.video_id, assets.url)
 
         # A previous partial run may have written rows for this video already.
         dropped = drop_video_records(self.ws.metadata, assets.video_id)
@@ -373,6 +424,33 @@ class Pipeline:
                 "elapsed": elapsed,
             },
         )
+        # Only after the state file says "complete": a video that failed keeps
+        # its download so a retry does not start from the network again.
+        self._cleanup(assets, prepared)
+
+    def _cleanup(self, assets: download.VideoAssets, prepared: audio.PreparedAudio) -> None:
+        """Delete this video's raw download and working WAVs.
+
+        These dominate disk use -- a 48 kHz and a 16 kHz master run about
+        0.5 GB per source hour together -- and nothing reads them once the
+        video is finished. The MP3, the subtitles, the speaker centroids and
+        the state file all stay, so `report --link-speakers` and resume still
+        work on a dataset built over many runs.
+        """
+        if self.cfg.runtime.keep_intermediates:
+            return
+
+        freed = 0
+        for path in (assets.audio_path, prepared.master_path, prepared.work_path):
+            if path is None:
+                continue
+            try:
+                freed += path.stat().st_size
+                path.unlink()
+            except OSError:  # already gone, or held open -- not worth failing over
+                continue
+        if freed:
+            log.debug("%s: freed %.0f MB of intermediates", assets.video_id, freed / 1e6)
 
     def _write_manifest(self, results: list[VideoResult]) -> None:
         write_json(

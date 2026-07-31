@@ -139,7 +139,12 @@ filters:
   drop_boundary_clipped_words: true
 
 runtime:
+  # How far downloading runs ahead of processing. Videos are still processed
+  # strictly one at a time; this only keeps the network busy during GPU work.
   download_workers: 4
   device: "cuda"
   # Keep GPU models resident between videos. 48 GB is plenty for the full set.
   keep_models_loaded: true
+  # Keep each video's raw download and 48k/16k working WAVs after it finishes.
+  # Roughly 0.5 GB per source hour, so a long run needs this off.
+  keep_intermediates: false
