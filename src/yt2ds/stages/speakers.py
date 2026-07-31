@@ -122,12 +122,19 @@ def _l2(vector: np.ndarray) -> np.ndarray:
 def link_across_videos(
     centroids: dict[str, np.ndarray],
     threshold: float,
+    weights: dict[str, float] | None = None,
 ) -> dict[str, str]:
     """Cluster per-video speakers into global identities.
 
     Agglomerative clustering with average linkage on cosine distance. Keys are
-    ``"<video_id>/<speaker>"``; the returned mapping sends each to a
-    ``GLOBAL_SPEAKER_xx`` label.
+    the namespaced ``"<video_id>_SPK<n>"`` labels; the returned mapping sends
+    each to a ``GLOBAL_SPEAKER_xx`` label.
+
+    ``weights`` maps a speaker key to its kept seconds. When given, global
+    labels are numbered by pooled duration, so ``GLOBAL_SPEAKER_00`` is the
+    voice with the most usable audio -- which is the ordering that matters when
+    choosing whom to clone. Without it, numbering falls back to cluster size,
+    which is meaningless when every cluster holds one speaker.
     """
     if not centroids:
         return {}
@@ -149,9 +156,14 @@ def link_across_videos(
         linkage="average",
     ).fit(distances)
 
-    # Number labels by descending cluster size so GLOBAL_SPEAKER_00 is the
-    # most prolific voice in the dataset.
     labels = clustering.labels_
-    order = sorted(set(labels), key=lambda lbl: -int((labels == lbl).sum()))
+
+    def rank(label: int) -> tuple[float, int]:
+        members = [key for key, lbl in zip(keys, labels) if lbl == label]
+        if weights:
+            return (-sum(weights.get(k, 0.0) for k in members), -len(members))
+        return (-float(len(members)), -len(members))
+
+    order = sorted(set(labels), key=rank)
     renumbered = {lbl: f"GLOBAL_SPEAKER_{i:02d}" for i, lbl in enumerate(order)}
     return {key: renumbered[label] for key, label in zip(keys, labels)}

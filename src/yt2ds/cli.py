@@ -187,7 +187,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             share = 100 * count / max(len(rejected), 1)
             print(f"  {reason:<12} {count:>6}  ({share:4.1f}%)")
 
-    linked = _link_speakers(ws, cfg) if args.link_speakers else {}
+    linked = _link_speakers(ws, cfg, per_speaker) if args.link_speakers else {}
     if linked:
         _rewrite_global_speakers(ws, linked)
         pooled: dict[str, float] = defaultdict(float)
@@ -213,8 +213,12 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _link_speakers(ws: Workspace, cfg: Config) -> dict[str, str]:
-    """Cluster the per-video speaker centroids saved during the run."""
+def _link_speakers(ws: Workspace, cfg: Config, per_speaker: dict[str, float]) -> dict[str, str]:
+    """Cluster the per-video speaker centroids saved during the run.
+
+    Kept seconds per speaker are passed through so global labels are numbered
+    by how much usable audio each voice has.
+    """
     from .stages.speakers import link_across_videos
 
     centroids: dict[str, np.ndarray] = {}
@@ -225,7 +229,7 @@ def _link_speakers(ws: Workspace, cfg: Config) -> dict[str, str]:
     if not centroids:
         print("\nno speaker embeddings found; run the pipeline first", file=sys.stderr)
         return {}
-    return link_across_videos(centroids, cfg.speakers.link_threshold)
+    return link_across_videos(centroids, cfg.speakers.link_threshold, weights=per_speaker)
 
 
 def _rewrite_global_speakers(ws: Workspace, linked: dict[str, str]) -> None:

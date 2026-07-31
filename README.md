@@ -127,10 +127,16 @@ dataset/
 ```
 
 Each `metadata.jsonl` row carries the text (`text`, `text_yt`, `text_cohere`,
-`text_source`, `cer_yt_vs_cohere`), the speaker (`speaker`, `global_speaker`,
-`speaker_conf`), and every quality score used to make the keep/drop decision
-(`squim_mos`, `squim_stoi`, `squim_pesq`, `music_score`, `vocal_ratio`,
-`snr_db`, `chars_per_sec`, …).
+`text_source`, `cer_yt_vs_cohere`), the language it was decoded in
+(`language`, `asr_language`, `asr_confidence`, `asr_confidence_alt`), the
+speaker (`speaker`, `global_speaker`, `speaker_conf`), and every quality score
+behind the keep/drop decision (`squim_mos`, `squim_stoi`, `squim_pesq`,
+`music_score`, `vocal_ratio`, `snr_db`, `chars_per_sec`, `script_ratio`, …).
+
+Runs are resumable: finished videos are skipped on a re-run, and adding a URL
+to an existing dataset only processes the new video. A video interrupted
+mid-write has its partial rows cleared before it is reprocessed, so
+`metadata.jsonl` never accumulates duplicates.
 
 ## Quality gates
 
