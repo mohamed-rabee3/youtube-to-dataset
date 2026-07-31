@@ -1,0 +1,145 @@
+# Default profile: TTS / voice cloning, Arabic (Saudi, Egyptian, any dialect).
+# Every threshold here is also settable from the CLI; see `yt2ds run --help`.
+
+profile: tts
+
+audio:
+  # Sample rate of the emitted dataset clips.
+  out_sample_rate: 24000
+  # Working copies. 16k feeds VAD/ASR/aligner/diarizer, 44.1k feeds Demucs.
+  work_sample_rate: 16000
+  demucs_sample_rate: 44100
+  # Per-video EBU R128 loudness target. Applied per video, not per chunk, so
+  # relative dynamics between chunks survive.
+  target_lufs: -23.0
+  # Write an archival mp3 of the full audio next to the raw download.
+  keep_mp3: true
+  # Set true to cut chunks from the mp3 instead of the lossless decode.
+  # Lossy; off by default. See README "MP3 note".
+  chunk_from_mp3: false
+
+download:
+  sub_langs: ["ar", "ar-SA", "ar-EG", "ar.*"]
+  # Manual subtitles are preferred over auto-generated when both exist.
+  prefer_manual_subs: true
+  sub_format: "json3/vtt/best"
+  # yt-dlp retries and rate limiting.
+  retries: 5
+  sleep_interval: 1
+  cookies_from_browser: null
+
+vad:
+  threshold: 0.5
+  min_speech_duration_ms: 250
+  min_silence_duration_ms: 200
+  speech_pad_ms: 100
+
+diarize:
+  model: "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
+  # Chunks overlapping two speakers are poison for voice cloning.
+  drop_overlap: true
+  # Guard against a diarizer that split one voice into many clusters.
+  collapse_single_speaker_ratio: 0.9
+
+segment:
+  min_duration: 2.0
+  max_duration: 12.0
+  # Same-speaker VAD regions closer than this are merged into one chunk.
+  merge_gap: 0.3
+  # Silence padding kept on each side of a chunk.
+  pad: 0.2
+  # A chunk longer than max_duration is split at its deepest internal pause,
+  # provided the pause is at least this long.
+  min_split_pause: 0.25
+
+music:
+  # Demucs vocals-vs-accompaniment energy. Above this, the chunk has too much
+  # music behind the speech.
+  max_accompaniment_ratio: 0.10
+  # AST AudioSet aggregate score over music-ish classes.
+  ast_model: "MIT/ast-finetuned-audioset-10-10-0.4593"
+  max_music_score: 0.20
+  music_labels:
+    - "Music"
+    - "Singing"
+    - "Musical instrument"
+    - "Applause"
+    - "Cheering"
+    - "Crowd"
+    - "Theme music"
+    - "Background music"
+    - "Drum"
+    - "Guitar"
+    - "Piano"
+
+speakers:
+  embed_model: "speechbrain/spkrec-ecapa-voxceleb"
+  # Cosine distance from a chunk to its own speaker centroid. Above this the
+  # chunk probably is not that speaker.
+  max_centroid_distance: 0.45
+  # Cross-video speaker linking (yt2ds report --link-speakers).
+  link_threshold: 0.35
+  min_speaker_seconds: 30.0
+
+asr:
+  model: "CohereLabs/cohere-transcribe-arabic-07-2026"
+  # The model has no auto-detect: it decodes under a language prompt. Each
+  # chunk is decoded once per language here and the higher-confidence result
+  # wins, so English segments come out as English instead of being forced into
+  # invented Arabic. Arabic-English code-switching *within* a chunk is handled
+  # by the model under whichever prompt scores better.
+  # Set to ["ar"] alone to halve ASR time on Arabic-only material.
+  languages: ["ar", "en"]
+  batch_size: 8
+  max_new_tokens: 256
+  dtype: "bfloat16"
+
+align:
+  model: "MahmoudAshraf/mms-300m-1130-forced-aligner"
+  batch_size: 4
+  # Alignment is run over windows of the full audio to bound memory.
+  window_seconds: 900.0
+  # Mean CTC log-probability per frame. Measured Arabic speech centres around
+  # -3.7, so this is set to catch only catastrophic alignment failure --
+  # the CER gate in `filters` does the primary text-quality work.
+  min_align_score: -5.5
+
+quality:
+  # torchaudio SQUIM. Estimated MOS, no reference needed.
+  min_mos: 3.0
+  min_stoi: 0.75
+  min_pesq: 1.8
+  min_snr_db: 12.0
+  max_clipping_ratio: 0.001
+  min_peak_dbfs: -35.0
+  max_peak_dbfs: -0.5
+
+filters:
+  # The fidelity gate: character error rate between the YouTube subtitle text
+  # and Cohere's transcription of the same chunk. Above this they disagree too
+  # much to trust either, so the chunk is dropped.
+  max_cer_yt_vs_cohere: 0.35
+  # Calibrated for Arabic script, which is far more compact than Latin:
+  # measured Saudi podcast speech runs 5.4-12.8 chars/sec, median 9.5.
+  # These bounds catch gross timing failures (text bled in from a neighbouring
+  # chunk, or speech the transcript missed) without touching normal speech.
+  min_chars_per_sec: 4.0
+  max_chars_per_sec: 18.0
+  min_words: 2
+  # Fraction of characters that must be in the script of the language the
+  # chunk was decoded in: Arabic for "ar", Latin for "en". Code-switched
+  # speech still passes, since this is a proportion and not a purity test.
+  min_script_ratio: 0.6
+  # Mean per-token log-probability floor for the transcript. Applied only when
+  # a video had no subtitles, because then the model's own confidence is the
+  # only guard against a hallucinated transcript.
+  min_asr_confidence: -1.0
+  # A word whose forced-aligned span is cut by the chunk boundary means the
+  # transcript does not match the audio in the clip.
+  drop_boundary_clipped_words: true
+
+runtime:
+  download_workers: 4
+  device: "cuda"
+  # Keep GPU models resident between videos. 48 GB is plenty for the full set.
+  keep_models_loaded: true

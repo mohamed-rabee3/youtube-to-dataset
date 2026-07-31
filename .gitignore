@@ -1,23 +1,40 @@
-### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs. Both are built by scripts/setup.sh.
+.venv/
+.venv-diarize/
+venv/
+
+# DiariZen source checkout, cloned by scripts/setup.sh.
+.diarizen/
+
+# Model caches
+.cache/
+*.pt
+*.pth
+*.onnx
+
+# Datasets and pipeline output. These are large and reproducible.
+dataset/
+datasets/
+out/
+*.jsonl
+wavs/
+mp3/
+.work/
+
+# Editors / OS
 .vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-files
-*.bclicense
-*.flf
-#Test results file
-TestResults.xml
+.idea/
+.DS_Store

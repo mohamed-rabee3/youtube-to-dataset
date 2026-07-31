@@ -1,0 +1,407 @@
+"""Per-video orchestration.
+
+Stage order is not arbitrary. Cohere Transcribe Arabic emits no timestamps, so
+the audio must be segmented *before* it is transcribed -- then each chunk's
+transcript is simply that chunk's text, with no alignment step able to go
+wrong. Forced alignment is needed only to map the YouTube subtitle text onto
+chunk boundaries.
+
+The expensive detectors run in an order chosen so each one only sees what
+survived the last: music rejection before ASR means Cohere never runs on a
+musical interlude, and speaker purity before ASR means it never runs on a chunk
+that is about to be dropped anyway.
+
+Chunk audio is read from disk in batches rather than all at once; a two-hour
+video can produce a thousand chunks, and holding them all as float arrays would
+not fit.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+
+import numpy as np
+
+from .config import Config
+from .io import JsonlWriter, Workspace, drop_video_records, write_json
+from .models import ModelRegistry
+from .stages import align, asr, audio, diarize, download, filters, music, quality, segment, speakers, subtitles, vad
+from .stages.segment import Chunk
+
+log = logging.getLogger(__name__)
+
+# How many chunks are held in memory at once.
+BATCH = 8
+
+
+@dataclass
+class VideoResult:
+    video_id: str
+    url: str
+    kept: int = 0
+    rejected: int = 0
+    seconds_kept: float = 0.0
+    speakers: dict[str, float] = field(default_factory=dict)
+    reasons: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+    skipped: bool = False
+
+
+class Pipeline:
+    def __init__(self, ws: Workspace, cfg: Config) -> None:
+        self.ws = ws.create()
+        self.cfg = cfg
+        self.registry = ModelRegistry(cfg)
+
+    # ------------------------------------------------------------------
+    def run(self, urls: list[str], resume: bool = True) -> list[VideoResult]:
+        video_urls = download.expand_urls(urls, self.cfg)
+        log.info("%d video(s) to process", len(video_urls))
+        if not video_urls:
+            return []
+
+        # Downloads are network-bound, so they overlap; everything after is
+        # GPU-bound and runs one video at a time.
+        assets = self._download_all(video_urls, resume)
+
+        results: list[VideoResult] = []
+        for asset in assets:
+            if asset is None:
+                continue
+            try:
+                results.append(self._process(asset, resume))
+            except Exception as exc:  # noqa: BLE001 - one bad video must not stop the run
+                log.exception("failed processing %s", asset.video_id)
+                results.append(VideoResult(video_id=asset.video_id, url=asset.url, error=str(exc)))
+
+        self._write_manifest(results)
+        return results
+
+    # ------------------------------------------------------------------
+    def _download_all(self, urls: list[str], resume: bool) -> list[download.VideoAssets | None]:
+        pending: list[str] = []
+        for url in urls:
+            pending.append(url)
+
+        workers = max(1, self.cfg.runtime.download_workers)
+        out: list[download.VideoAssets | None] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for asset in pool.map(lambda u: self._download_one(u, resume), pending):
+                out.append(asset)
+        return out
+
+    def _download_one(self, url: str, resume: bool) -> download.VideoAssets | None:
+        try:
+            assets = download.download(url, self.ws, self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.error("download error for %s: %s", url, exc)
+            return None
+        if assets.error:
+            log.error("%s: %s", url, assets.error)
+            return None
+        return assets
+
+    # ------------------------------------------------------------------
+    def _process(self, assets: download.VideoAssets, resume: bool) -> VideoResult:
+        result = VideoResult(video_id=assets.video_id, url=assets.url)
+
+        if resume and self.ws.is_complete(assets.video_id):
+            log.info("%s: already complete, skipping", assets.video_id)
+            state = self.ws.load_state(assets.video_id)
+            result.kept = state.get("kept", 0)
+            result.rejected = state.get("rejected", 0)
+            result.seconds_kept = state.get("seconds_kept", 0.0)
+            result.speakers = state.get("speakers", {})
+            result.reasons = state.get("reasons", {})
+            result.skipped = True
+            return result
+
+        # A previous partial run may have written rows for this video already.
+        dropped = drop_video_records(self.ws.metadata, assets.video_id)
+        dropped += drop_video_records(self.ws.rejected, assets.video_id)
+        if dropped:
+            log.info("%s: cleared %d rows from an incomplete previous run", assets.video_id, dropped)
+
+        started = time.time()
+        prepared = audio.prepare(assets, self.ws, self.cfg)
+        log.info("%s: %.1fs of audio, %.1f LUFS", assets.video_id, prepared.duration, prepared.lufs)
+
+        subs = subtitles.Subtitles()
+        if assets.sub_path is not None:
+            subs = subtitles.parse(assets.sub_path, kind=assets.sub_kind or "", lang=assets.sub_lang or "")
+            log.info(
+                "%s: %d subtitle words (%s, %s)",
+                assets.video_id,
+                len(subs.words),
+                assets.sub_kind,
+                assets.sub_lang,
+            )
+
+        annotation = self._diarize(prepared, assets.video_id)
+        regions = vad.detect(prepared.work_path, self.cfg, self.registry)
+        chunks = segment.build(regions, annotation, self.cfg, prepared.duration)
+        log.info("%s: %d candidate chunks", assets.video_id, len(chunks))
+        if not chunks:
+            self._finish(assets, result, prepared, started)
+            return result
+
+        # Namespace the diarizer's local labels so they stay distinct across
+        # videos before cross-video linking runs.
+        for chunk in chunks:
+            chunk.speaker = f"{assets.video_id}_SPK{chunk.speaker}"
+
+        self._score_chunks(chunks, prepared, assets.video_id)
+
+        if subs:
+            aligned = align.align(prepared.work_path, subs, self.cfg, self.registry)
+            log.info("%s: aligned %d/%d subtitle words", assets.video_id, len(aligned), len(subs.words))
+            align.assign_to_chunks(chunks, aligned, self.cfg)
+
+        filters.resolve_text(chunks, assets.sub_kind, self.cfg)
+        quality.apply_gates(chunks, self.cfg)
+
+        self._emit(chunks, assets, prepared, result)
+        self._finish(assets, result, prepared, started)
+        return result
+
+    # ------------------------------------------------------------------
+    def _diarize(self, prepared: audio.PreparedAudio, video_id: str) -> diarize.Diarization:
+        try:
+            annotation = diarize.run(prepared.work_path, self.ws, self.cfg, video_id)
+        except diarize.DiarizerUnavailable as exc:
+            log.error("%s -- continuing with a single-speaker assumption", exc)
+            return diarize.single_speaker(prepared.duration)
+        except Exception as exc:  # noqa: BLE001
+            log.error("diarization failed for %s (%s); assuming one speaker", video_id, exc)
+            return diarize.single_speaker(prepared.duration)
+
+        log.info("%s: %d speakers, %d turns", video_id, len(annotation.speakers), len(annotation.turns))
+        return diarize.collapse_if_dominant(annotation, self.cfg)
+
+    # ------------------------------------------------------------------
+    def _score_chunks(self, chunks: list[Chunk], prepared: audio.PreparedAudio, video_id: str) -> None:
+        """Run the GPU detectors over every chunk, batch by batch."""
+        sr = prepared.master_sr
+        embeddings: list[np.ndarray] = []
+        reference: np.ndarray | None = None
+
+        for batch in _batched(chunks, BATCH):
+            items = [(c, audio.read_segment(prepared.master_path, sr, c.start, c.end)) for c in batch]
+
+            music.score_batch(items, sr, self.cfg, self.registry)
+            quality.score_batch(items, sr, self.cfg, self.registry, reference=reference)
+            if reference is None:
+                reference = quality.pick_reference(items, sr)
+
+            embeddings.append(speakers.embed_batch(items, sr, self.cfg, self.registry))
+
+            # Only transcribe what is still alive: no point running a 2B model
+            # over a chunk already rejected as music.
+            alive = [(c, a) for c, a in items if c.reject_reason is None]
+            if alive:
+                texts = asr.transcribe_batch(alive, sr, self.cfg, self.registry)
+                for (chunk, _), text in zip(alive, texts):
+                    chunk.text_cohere = text
+
+        # The SQUIM MOS reference is only available once the first batch has
+        # been scored, so that batch comes back unscored. Backfill it now.
+        self._backfill_mos(chunks, prepared, reference)
+
+        if embeddings:
+            matrix = np.concatenate(embeddings, axis=0)
+            centroids = speakers.verify_purity(chunks, matrix, self.cfg)
+            self._save_centroids(video_id, centroids)
+
+    def _backfill_mos(
+        self,
+        chunks: list[Chunk],
+        prepared: audio.PreparedAudio,
+        reference: np.ndarray | None,
+    ) -> None:
+        if reference is None:
+            return
+        missing = [c for c in chunks if c.reject_reason is None and c.scores.get("squim_mos") is None]
+        if not missing:
+            return
+        sr = prepared.master_sr
+        for batch in _batched(missing, BATCH):
+            items = [(c, audio.read_segment(prepared.master_path, sr, c.start, c.end)) for c in batch]
+            quality.score_batch(items, sr, self.cfg, self.registry, reference=reference)
+
+    def _save_centroids(self, video_id: str, centroids: dict[str, np.ndarray]) -> None:
+        """Persist per-speaker centroids for `report --link-speakers`.
+
+        Keys are the already-namespaced speaker labels, so centroids from
+        different videos never collide when they are pooled for clustering.
+        """
+        if not centroids:
+            return
+        np.savez(self.ws.embeddings / f"{video_id}.npz", **centroids)
+
+    # ------------------------------------------------------------------
+    def _emit(
+        self,
+        chunks: list[Chunk],
+        assets: download.VideoAssets,
+        prepared: audio.PreparedAudio,
+        result: VideoResult,
+    ) -> None:
+        out_sr = self.cfg.audio.out_sample_rate
+        source = prepared.mp3_path if self.cfg.audio.chunk_from_mp3 and prepared.mp3_path else prepared.master_path
+        source_sr = 44100 if source is prepared.mp3_path else prepared.master_sr
+
+        kept_records: list[dict[str, Any]] = []
+        rejected_records: list[dict[str, Any]] = []
+
+        for chunk in chunks:
+            record = self._record(chunk, assets, prepared, out_sr)
+            if chunk.reject_reason is not None:
+                record["reject_reason"] = chunk.reject_reason
+                rejected_records.append(record)
+                continue
+
+            samples = audio.read_segment(source, source_sr, chunk.start, chunk.end)
+            samples = audio.apply_gain(samples, prepared.gain_db)
+            samples = audio.resample(samples, source_sr, out_sr)
+            if samples.size == 0:
+                record["reject_reason"] = "audio:empty"
+                rejected_records.append(record)
+                continue
+
+            audio.write_wav(self.ws.wavs / record["audio_file"], samples, out_sr)
+            kept_records.append(record)
+            result.seconds_kept += chunk.duration
+            result.speakers[chunk.speaker] = result.speakers.get(chunk.speaker, 0.0) + chunk.duration
+
+        with JsonlWriter(self.ws.metadata) as fh:
+            fh.write_all(kept_records)
+        with JsonlWriter(self.ws.rejected) as fh:
+            fh.write_all(rejected_records)
+
+        result.kept = len(kept_records)
+        result.rejected = len(rejected_records)
+        result.reasons = filters.summarize(chunks)
+
+    def _record(
+        self,
+        chunk: Chunk,
+        assets: download.VideoAssets,
+        prepared: audio.PreparedAudio,
+        out_sr: int,
+    ) -> dict[str, Any]:
+        s = chunk.scores
+        return {
+            "audio_file": f"{assets.video_id}_{chunk.index:04d}.wav",
+            "video_id": assets.video_id,
+            "video_url": assets.url,
+            "title": assets.title,
+            "channel": assets.channel,
+            "upload_date": assets.upload_date,
+            "chunk_index": chunk.index,
+            "start": round(chunk.start, 3),
+            "end": round(chunk.end, 3),
+            "duration": round(chunk.duration, 3),
+            "speaker": chunk.speaker,
+            "global_speaker": None,
+            "speaker_conf": s.get("speaker_conf"),
+            "text": chunk.text,
+            "text_source": chunk.text_source,
+            "text_yt": chunk.text_yt,
+            "text_cohere": chunk.text_cohere,
+            "cer_yt_vs_cohere": s.get("cer_yt_vs_cohere"),
+            "asr_language": s.get("asr_language"),
+            "asr_confidence": s.get("asr_confidence"),
+            "asr_confidence_alt": s.get("asr_confidence_alt"),
+            "align_score": s.get("align_score"),
+            "aligned_words": s.get("aligned_words"),
+            "boundary_clipped": s.get("boundary_clipped"),
+            "music_score": s.get("music_score"),
+            "music_label": s.get("music_label"),
+            "speech_score": s.get("speech_score"),
+            "vocal_ratio": s.get("vocal_ratio"),
+            "accompaniment_ratio": s.get("accompaniment_ratio"),
+            "squim_mos": s.get("squim_mos"),
+            "squim_stoi": s.get("squim_stoi"),
+            "squim_pesq": s.get("squim_pesq"),
+            "squim_si_sdr": s.get("squim_si_sdr"),
+            "snr_db": s.get("snr_db"),
+            "peak_dbfs": s.get("peak_dbfs"),
+            "rms_dbfs": s.get("rms_dbfs"),
+            "clipping_ratio": s.get("clipping_ratio"),
+            "arabic_ratio": s.get("arabic_ratio"),
+            "script_ratio": s.get("script_ratio"),
+            "chars_per_sec": s.get("chars_per_sec"),
+            "lufs": round(prepared.lufs, 3) if prepared.lufs == prepared.lufs else None,
+            "sample_rate": out_sr,
+            # The language the transcript is actually in, not an assumption.
+            "language": s.get("asr_language") or "ar",
+        }
+
+    # ------------------------------------------------------------------
+    def _finish(
+        self,
+        assets: download.VideoAssets,
+        result: VideoResult,
+        prepared: audio.PreparedAudio,
+        started: float,
+    ) -> None:
+        elapsed = time.time() - started
+        log.info(
+            "%s: kept %d, rejected %d, %.1f min of audio in %.0fs",
+            assets.video_id,
+            result.kept,
+            result.rejected,
+            result.seconds_kept / 60,
+            elapsed,
+        )
+        self.ws.save_state(
+            assets.video_id,
+            {
+                "complete": True,
+                "url": assets.url,
+                "kept": result.kept,
+                "rejected": result.rejected,
+                "seconds_kept": result.seconds_kept,
+                "speakers": result.speakers,
+                "reasons": result.reasons,
+                "duration": prepared.duration,
+                "elapsed": elapsed,
+            },
+        )
+
+    def _write_manifest(self, results: list[VideoResult]) -> None:
+        write_json(
+            self.ws.manifest,
+            {
+                "config": self.cfg.to_dict(),
+                "videos": [
+                    {
+                        "video_id": r.video_id,
+                        "url": r.url,
+                        "kept": r.kept,
+                        "rejected": r.rejected,
+                        "seconds_kept": round(r.seconds_kept, 2),
+                        "reasons": r.reasons,
+                        "error": r.error,
+                        "skipped": r.skipped,
+                    }
+                    for r in results
+                ],
+                "totals": {
+                    "videos": len(results),
+                    "kept": sum(r.kept for r in results),
+                    "rejected": sum(r.rejected for r in results),
+                    "hours_kept": round(sum(r.seconds_kept for r in results) / 3600, 3),
+                },
+            },
+        )
+
+
+def _batched(items: list[Chunk], size: int) -> Iterator[list[Chunk]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
