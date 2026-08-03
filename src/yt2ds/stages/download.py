@@ -6,12 +6,20 @@ knows with certainty whether it got a human-written track or an
 auto-generated one -- which matters, because auto-generated Arabic captions
 on dialectal speech are frequently wrong, and the pipeline treats them with
 more suspicion downstream.
+
+Every network call goes through `_extract`, which retries the *whole*
+extraction under a different YouTube player client each time. yt-dlp's own
+`retries` only re-issues the same request to the same client, which does
+nothing for the failures that actually matter here -- a bot check or a 403 on
+the media URL is a property of the client YouTube answered, so the fix is to
+ask as something else.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,61 +94,101 @@ def video_id_from_url(url: str) -> str | None:
 
 def probe(url: str, cfg: Config) -> dict[str, Any] | None:
     """Fetch metadata for a single video without downloading media."""
-    import yt_dlp
-
-    opts = _base_opts(cfg)
-    opts.update({"skip_download": True, "quiet": True})
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            return ydl.extract_info(url, download=False)
-        except Exception as exc:  # noqa: BLE001 - yt-dlp raises many types
-            log.error("probe failed for %s: %s", url, exc)
-            return None
+    info, error = _extract(url, cfg, {"skip_download": True}, download=False)
+    if info is None:
+        log.error("probe failed for %s: %s", url, error)
+    return info
 
 
-def expand_urls(urls: list[str], cfg: Config) -> list[str]:
+def expand_urls(urls: list[str], cfg: Config, max_depth: int = 2) -> list[str]:
     """Expand playlist and channel URLs into individual video URLs.
 
     Plain video URLs pass through untouched, so callers can mix single links
-    and playlists in one invocation.
-    """
-    import yt_dlp
+    and playlists in one invocation. Entries a flat listing already reports as
+    private, deleted or upcoming are dropped here rather than becoming
+    guaranteed download failures later.
 
-    opts = _base_opts(cfg)
-    opts.update({"extract_flat": "in_playlist", "skip_download": True, "quiet": True})
+    A listing can contain listings -- a channel's `/playlists` tab is a page of
+    playlist links, not videos -- so anything that comes back still pointing at
+    a container is queued and expanded in turn, up to ``max_depth``.
+    """
+    from collections import deque
+
+    extra = {
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        # One dead entry must not abort a 200-video playlist.
+        "ignoreerrors": True,
+        # `_base_opts` pins this on so the *download* of one video can never
+        # drag in a playlist. Expansion is the one place that has to see it.
+        "noplaylist": not cfg.download.follow_playlist,
+    }
 
     expanded: list[str] = []
     seen: set[str] = set()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        for url in urls:
-            try:
-                info = ydl.extract_info(url, download=False, process=False)
-            except Exception as exc:  # noqa: BLE001
-                log.error("could not expand %s: %s", url, exc)
+    queue: deque[tuple[str, int]] = deque((url, 0) for url in urls)
+    visited: set[str] = set(urls)
+
+    while queue:
+        url, depth = queue.popleft()
+        info, error = _extract(url, cfg, extra, download=False, process=False)
+        if info is None:
+            log.error("could not expand %s: %s", url, error)
+            continue
+
+        before = len(expanded)
+        for item in _iter_entries(info):
+            if video_id_from_url(item) is None:
+                # A nested container. Depth is bounded so a channel cannot walk
+                # into an unbounded tree of related listings.
+                if depth < max_depth and item not in visited:
+                    visited.add(item)
+                    queue.append((item, depth + 1))
                 continue
-            if info is None:
-                continue
-            for video_url in _iter_entries(info):
-                if video_url not in seen:
-                    seen.add(video_url)
-                    expanded.append(video_url)
+            if item not in seen:
+                seen.add(item)
+                expanded.append(item)
+
+        found = len(expanded) - before
+        if found != 1 or video_id_from_url(url) is None:
+            log.info("%s -> %d video(s)", url, found)
     return expanded
 
 
+# Placeholder titles YouTube uses for entries that cannot be downloaded.
+_DEAD_ENTRY_TITLES = ("[private video]", "[deleted video]", "[unavailable video]")
+
+
 def _iter_entries(info: dict[str, Any]):
-    """Walk a possibly nested playlist structure and yield video URLs."""
-    if info.get("_type") in (None, "video"):
+    """Walk a flat listing and yield video URLs, plus any nested listing URLs.
+
+    Flat extraction (``process=False``) reports playlist members as ``url``
+    entries carrying only an id -- that is the whole point of it, and those
+    entries are what a playlist expands to. A ``url`` entry whose extractor is
+    ``YoutubeTab`` is another listing rather than a video; it is yielded as-is
+    so the caller can expand it separately.
+    """
+    kind = info.get("_type")
+
+    if kind in (None, "video", "url", "url_transparent"):
+        if kind in ("url", "url_transparent") and info.get("ie_key") not in (None, "Youtube"):
+            nested = info.get("url")
+            if nested:
+                yield nested
+            return
+        if str(info.get("title") or "").strip().lower() in _DEAD_ENTRY_TITLES:
+            return
+        if info.get("live_status") in ("is_upcoming", "is_live"):
+            log.info("skipping live/upcoming video %s", info.get("id"))
+            return
         vid = info.get("id")
         if vid:
             yield f"https://www.youtube.com/watch?v={vid}"
         return
+
     for entry in info.get("entries") or []:
-        if entry is None:
-            continue
-        if entry.get("_type") == "url" and entry.get("ie_key") not in (None, "Youtube"):
-            # A channel's tab links to sub-playlists; recurse into them lazily.
-            continue
-        yield from _iter_entries(entry)
+        if entry is not None:
+            yield from _iter_entries(entry)
 
 
 def _base_opts(cfg: Config) -> dict[str, Any]:
@@ -150,23 +198,130 @@ def _base_opts(cfg: Config) -> dict[str, Any]:
         "noprogress": True,
         "retries": cfg.download.retries,
         "fragment_retries": cfg.download.retries,
+        "extractor_retries": cfg.download.retries,
+        "file_access_retries": cfg.download.retries,
+        # Back off rather than hammering: a burst of immediate retries is what
+        # turns a transient throttle into a sustained block.
+        "retry_sleep_functions": {
+            key: (lambda n: min(2**n, 60)) for key in ("http", "fragment", "file_access", "extractor")
+        },
+        "socket_timeout": cfg.download.socket_timeout,
         "sleep_interval_requests": cfg.download.sleep_interval,
+        # A watch URL that carries &list= must not drag in the playlist.
+        "noplaylist": True,
+        # Resume a half-finished .part instead of starting the file again.
+        "continuedl": True,
         "ignoreerrors": False,
     }
+    if cfg.download.cookies_file:
+        opts["cookiefile"] = str(cfg.download.cookies_file)
     if cfg.download.cookies_from_browser:
         opts["cookiesfrombrowser"] = (cfg.download.cookies_from_browser,)
     return opts
 
 
-def download(url: str, ws: Workspace, cfg: Config) -> VideoAssets:
-    """Download one video's audio plus its best Arabic subtitle track."""
+# Failures no player client and no amount of waiting will fix. Retrying these
+# just multiplies the wait before the run moves on.
+_PERMANENT = (
+    "private video",
+    "members-only",
+    "members only",
+    "join this channel",
+    "removed by the user",
+    "removed by the uploader",
+    "has been terminated",
+    "video has been removed",
+    "violat",
+    "not available in your country",
+    "blocked it on copyright grounds",
+    "this live event will begin",
+    "premieres in",
+    "unable to extract video id",
+    "is not a valid url",
+    "unsupported url",
+)
+
+
+def _is_permanent(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _PERMANENT)
+
+
+def _client_sequence(cfg: Config) -> list[str]:
+    """Player clients to try, in order, deduplicated."""
+    seen: set[str] = set()
+    clients = [c for c in cfg.download.player_clients if c and not (c in seen or seen.add(c))]
+    return clients or ["default"]
+
+
+def _extract(
+    url: str,
+    cfg: Config,
+    extra: dict[str, Any],
+    *,
+    download: bool,
+    process: bool = True,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Run one yt-dlp extraction, retrying under successive player clients.
+
+    Returns ``(info, None)`` on success or ``(None, message)`` once every
+    client has been tried -- the caller decides whether that is fatal.
+    """
     import yt_dlp
 
-    info = probe(url, cfg)
+    clients = _client_sequence(cfg)
+    last_error = "no attempt made"
+
+    for attempt, client in enumerate(clients, start=1):
+        opts = _base_opts(cfg)
+        opts.update(extra)
+        if client != "default":
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=download, process=process)
+            if info is not None:
+                if attempt > 1:
+                    log.info("%s: succeeded on attempt %d (client=%s)", url, attempt, client)
+                return info, None
+            # ignoreerrors turns a failed extraction into a None return.
+            last_error = "extraction returned nothing"
+        except Exception as exc:  # noqa: BLE001 - yt-dlp raises many types
+            last_error = str(exc).strip() or exc.__class__.__name__
+            if _is_permanent(last_error):
+                log.warning("%s: %s (not retrying)", url, last_error)
+                return None, last_error
+
+        if attempt < len(clients):
+            delay = cfg.download.attempt_backoff * attempt
+            log.warning(
+                "%s: attempt %d/%d failed (client=%s): %s -- retrying in %.0fs",
+                url,
+                attempt,
+                len(clients),
+                client,
+                last_error,
+                delay,
+            )
+            time.sleep(delay)
+
+    return None, last_error
+
+
+def download(url: str, ws: Workspace, cfg: Config) -> VideoAssets:
+    """Download one video's audio plus its best Arabic subtitle track."""
+    info, probe_error = _extract(url, cfg, {"skip_download": True}, download=False)
     if info is None:
-        return VideoAssets(video_id="unknown", url=url, error="probe failed")
+        return VideoAssets(
+            video_id=video_id_from_url(url) or "unknown",
+            url=url,
+            error=f"probe failed: {probe_error}",
+        )
 
     video_id = info.get("id") or "unknown"
+    if cfg.download.skip_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
+        return VideoAssets(video_id=video_id, url=url, error="live or upcoming stream; skipped")
+
     assets = VideoAssets(
         video_id=video_id,
         url=info.get("webpage_url") or url,
@@ -192,24 +347,24 @@ def download(url: str, ws: Workspace, cfg: Config) -> VideoAssets:
         sub_lang = _match_lang(manual, cfg.download.sub_langs)
         sub_kind = "yt_manual" if sub_lang else None
 
-    opts = _base_opts(cfg)
-    opts.update(
-        {
-            "format": "bestaudio/best",
-            # `paths` is ignored when an outtmpl is absolute, so the subtitle
-            # destination has to be spelled out here or the .json3 lands in
-            # raw/ next to the audio.
-            "outtmpl": {
-                "default": str(ws.raw / "%(id)s.%(ext)s"),
-                "subtitle": str(ws.subs / "%(id)s.%(ext)s"),
-                "infojson": str(ws.raw / "%(id)s.%(ext)s"),
-            },
-            "writeinfojson": True,
-            "skip_download": False,
-        }
-    )
+    extra: dict[str, Any] = {
+        # Prefer a plain audio-only stream, but fall back all the way to a
+        # progressive video file rather than failing: some videos expose no
+        # DASH audio to the client that answered.
+        "format": "bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best",
+        # `paths` is ignored when an outtmpl is absolute, so the subtitle
+        # destination has to be spelled out here or the .json3 lands in
+        # raw/ next to the audio.
+        "outtmpl": {
+            "default": str(ws.raw / "%(id)s.%(ext)s"),
+            "subtitle": str(ws.subs / "%(id)s.%(ext)s"),
+            "infojson": str(ws.raw / "%(id)s.%(ext)s"),
+        },
+        "writeinfojson": True,
+        "skip_download": False,
+    }
     if sub_lang:
-        opts.update(
+        extra.update(
             {
                 # Request exactly one track so there is no ambiguity about
                 # which file on disk is which.
@@ -220,12 +375,18 @@ def download(url: str, ws: Workspace, cfg: Config) -> VideoAssets:
             }
         )
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            downloaded = ydl.extract_info(assets.url, download=True)
-    except Exception as exc:  # noqa: BLE001
-        assets.error = f"download failed: {exc}"
-        log.error("download failed for %s: %s", url, exc)
+    downloaded, error = _extract(assets.url, cfg, extra, download=True)
+    if downloaded is None and sub_lang:
+        # The audio is the dataset; the captions are a second opinion. Never
+        # lose a video because its subtitle track would not come down.
+        log.warning("%s: retrying without subtitles after: %s", video_id, error)
+        for key in ("writesubtitles", "writeautomaticsub", "subtitleslangs", "subtitlesformat"):
+            extra.pop(key, None)
+        sub_lang = sub_kind = None
+        downloaded, error = _extract(assets.url, cfg, extra, download=True)
+    if downloaded is None:
+        assets.error = f"download failed: {error}"
+        log.error("download failed for %s: %s", url, error)
         return assets
 
     audio = _downloaded_path(downloaded) or _find_audio(ws.raw, video_id)

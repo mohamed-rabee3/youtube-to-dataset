@@ -14,7 +14,19 @@ yt2ds report dataset/ --link-speakers
 ```
 
 Playlist and channel URLs are expanded automatically, so a whole podcast series
-is one argument.
+is one argument:
+
+```bash
+yt2ds run "https://www.youtube.com/playlist?list=PL..." --out dataset/
+yt2ds run "https://www.youtube.com/@channel"            --out dataset/
+yt2ds run "https://www.youtube.com/@channel/playlists"  --out dataset/
+```
+
+Videos the listing already reports as private, deleted, live or upcoming are
+dropped during expansion rather than becoming guaranteed download failures
+later, and a listing that contains listings — a channel's `/playlists` tab — is
+expanded in turn. Duplicates across several links are collapsed, so overlapping
+playlists cost one download each.
 
 ## Many videos, one dataset
 
@@ -36,9 +48,56 @@ video.
 
 Downloading runs a few videos ahead of processing so the GPU is never waiting
 on the network, but never further: `--workers 1` keeps exactly one download in
-flight. Each video's raw download and working WAVs are deleted once it is
-complete (about 0.5 GB per source hour), so a hundred-video run does not fill
-the disk with intermediates. `--keep-intermediates` turns that off.
+flight.
+
+**Each video is deleted as soon as its clips are written.** The download, the
+two decoded masters, the MP3, the caption file and the info JSON are all spent
+once the chunks are on disk and their transcripts are in `metadata.jsonl` —
+about 0.5 GB per source hour, plus ~27 MB of MP3 per video. A thousand-video
+run would otherwise need far more space for its scratch than for its output.
+`--keep-intermediates` keeps the lot; `--keep-mp3` keeps just the archival MP3.
+
+## When downloads fail
+
+YouTube answers each of its own player clients differently. The same video that
+returns *"Sign in to confirm you're not a bot"* or a 403 on its media URL to
+one client often downloads cleanly as another, which is why plain retries — the
+same request, to the same client, again — do not help.
+
+So every extraction is retried under a **different player client** each time,
+with a growing pause between attempts:
+
+```yaml
+download:
+  player_clients: ["default", "tv_simply", "web_safari", "android_vr", "ios", "mweb"]
+  attempt_backoff: 4.0
+```
+
+Failures that no client can fix — private, members-only, removed, geo-blocked —
+are recognised and not retried, so a dead link costs one attempt rather than
+six. If the audio comes down but the subtitle track will not, the video is
+re-fetched without subtitles: the captions are a second opinion, never a reason
+to lose a video.
+
+Everything that still fails is written to `dataset/failed.txt` with its reason,
+in `--urls-file` format. A failed video saves no state, so feeding that file
+back retries exactly those and nothing else:
+
+```bash
+yt2ds run --urls-file dataset/failed.txt --out dataset/
+```
+
+**Cookies are the real fix for bot checks.** A datacentre IP trips them
+eventually no matter which client asks. Export a `cookies.txt` from a
+logged-in session and pass it:
+
+```bash
+yt2ds run --urls-file links.txt --out dataset/ --cookies cookies.txt
+yt2ds run --urls-file links.txt --out dataset/ --cookies-from-browser chrome
+```
+
+If a whole run starts failing, lower `--workers` before anything else — several
+parallel downloads from one IP is what triggers throttling in the first place.
 
 ## What it does
 
@@ -146,8 +205,9 @@ dataset/
 ├── rejected.jsonl        # every dropped clip + reason + scores
 ├── speakers.json         # per-speaker hours, global speaker links
 ├── manifest.json         # run config, per-video summary
-├── mp3/                  # archival full-length audio
-└── .work/                # intermediates; safe to delete
+├── failed.txt            # URLs that failed + why; feed back with --urls-file
+├── mp3/                  # archival full-length audio, only with --keep-mp3
+└── .work/                # state + speaker centroids; safe to delete
 ```
 
 Each `metadata.jsonl` row carries the text (`text`, `text_yt`, `text_cohere`,
@@ -187,11 +247,15 @@ All configurable in `configs/default.yaml` or via CLI flags:
 
 ## MP3 note
 
-You may notice chunks are not cut from the MP3. Converting to MP3 and then
+Chunks are never cut from the MP3 by default. Converting to MP3 and then
 slicing training clips out of the decoded result bakes compression artefacts
-into the dataset, so the pipeline decodes the download straight to lossless WAV
-and writes the MP3 alongside as an archive. Set `audio.chunk_from_mp3: true` to
-cut from the MP3 anyway.
+into the dataset, so the pipeline decodes the download straight to lossless WAV.
+Set `audio.chunk_from_mp3: true` to cut from the MP3 anyway — it is encoded on
+demand for that, then deleted with the rest.
+
+`--keep-mp3` (or `audio.keep_mp3: true`) keeps a full-length MP3 per video in
+`mp3/` as an archive. It is off by default: nothing downstream reads it, and at
+~27 MB per video it outgrows the dataset it accompanies.
 
 ## Development
 

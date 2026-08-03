@@ -142,6 +142,61 @@ class TestResumeAcrossRuns:
         assert result.skipped
 
 
+class TestFailedUrls:
+    """A failed video has to come back out in a form that can be re-fed."""
+
+    def test_failures_are_written_with_their_reason(self, ws, cfg, monkeypatch):
+        from yt2ds.pipeline import VideoResult
+        from yt2ds.stages import download as dl
+
+        monkeypatch.setattr(dl, "expand_urls", lambda urls, cfg: urls)
+        pipeline = Pipeline(ws, cfg)
+        monkeypatch.setattr(
+            pipeline,
+            "_download_one",
+            lambda url: VideoAssets(
+                video_id=video_id_from_url(url) or "?",
+                url=url,
+                error="download failed: HTTP Error 403" if "bad00" in url else None,
+            ),
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "_process",
+            lambda assets, resume: VideoResult(video_id=assets.video_id, url=assets.url, kept=1),
+        )
+
+        pipeline.run(
+            [
+                "https://www.youtube.com/watch?v=good0",
+                "https://www.youtube.com/watch?v=bad00",
+            ]
+        )
+
+        text = ws.failed.read_text(encoding="utf-8")
+        assert "403" in text
+        # Comment lines are skipped by --urls-file, so this feeds straight back.
+        urls = [line for line in text.splitlines() if not line.startswith("#")]
+        assert urls == ["https://www.youtube.com/watch?v=bad00"]
+
+    def test_the_file_is_removed_when_nothing_failed(self, ws, cfg, monkeypatch):
+        from yt2ds.pipeline import VideoResult
+        from yt2ds.stages import download as dl
+
+        ws.failed.write_text("https://www.youtube.com/watch?v=stale\n", encoding="utf-8")
+        monkeypatch.setattr(dl, "expand_urls", lambda urls, cfg: urls)
+        pipeline = Pipeline(ws, cfg)
+        monkeypatch.setattr(pipeline, "_download_one", lambda url: VideoAssets(video_id="good0", url=url))
+        monkeypatch.setattr(
+            pipeline,
+            "_process",
+            lambda assets, resume: VideoResult(video_id=assets.video_id, url=assets.url, kept=1),
+        )
+
+        pipeline.run(["https://www.youtube.com/watch?v=good0"])
+        assert not ws.failed.exists()
+
+
 class TestAccumulation:
     """Rows from many videos pile up in one metadata.jsonl without duplicates."""
 
@@ -182,16 +237,49 @@ class TestCleanup:
         master = tmp_path / "v.48k.wav"
         work = tmp_path / "v.16k.wav"
         mp3 = tmp_path / "v.mp3"
+        sub = tmp_path / "v.ar.json3"
+        info = ws.raw / "v.info.json"
+        for path in (raw, master, work, mp3, sub, info):
+            path.write_bytes(b"x" * 16)
+
+        assets = VideoAssets(video_id="v", url="u", audio_path=raw, sub_path=sub)
+        prepared = PreparedAudio("v", master, work, mp3, 10.0, 48000, 16000, -20.0, 3.0)
+
+        Pipeline(ws, cfg)._cleanup(assets, prepared)
+
+        for path in (raw, master, work, mp3, sub, info):
+            assert not path.exists(), f"{path.name} survived cleanup"
+
+    def test_a_stale_mp3_from_an_earlier_run_is_removed(self, ws, cfg, tmp_path):
+        """Nothing was written this time, but an archive may still be on disk."""
+        from yt2ds.stages.audio import PreparedAudio
+
+        stale = ws.mp3 / "v.mp3"
+        stale.write_bytes(b"x" * 16)
+
+        assets = VideoAssets(video_id="v", url="u", audio_path=None)
+        prepared = PreparedAudio("v", tmp_path / "m.wav", tmp_path / "w.wav", None, 10.0, 48000, 16000, -20.0, 3.0)
+        Pipeline(ws, cfg)._cleanup(assets, prepared)
+
+        assert not stale.exists()
+
+    def test_keep_mp3_preserves_the_archive(self, ws, cfg, tmp_path):
+        from yt2ds.stages.audio import PreparedAudio
+
+        cfg.audio.keep_mp3 = True
+        raw = tmp_path / "raw.webm"
+        master = tmp_path / "v.48k.wav"
+        work = tmp_path / "v.16k.wav"
+        mp3 = ws.mp3 / "v.mp3"
         for path in (raw, master, work, mp3):
             path.write_bytes(b"x" * 16)
 
         assets = VideoAssets(video_id="v", url="u", audio_path=raw)
         prepared = PreparedAudio("v", master, work, mp3, 10.0, 48000, 16000, -20.0, 3.0)
-
         Pipeline(ws, cfg)._cleanup(assets, prepared)
 
-        assert not raw.exists() and not master.exists() and not work.exists()
-        assert mp3.exists(), "the archival MP3 is a deliverable, not an intermediate"
+        assert mp3.exists(), "--keep-mp3 asked for the archive"
+        assert not raw.exists() and not master.exists()
 
     def test_keep_intermediates_preserves_everything(self, ws, cfg, tmp_path):
         from yt2ds.stages.audio import PreparedAudio

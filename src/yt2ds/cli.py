@@ -54,6 +54,22 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="build a dataset from one or more YouTube links")
     run.add_argument("urls", nargs="*", help="video, playlist, or channel URLs")
     run.add_argument("--urls-file", type=Path, help="file with one URL per line (# comments allowed)")
+    run.add_argument(
+        "--cookies",
+        type=Path,
+        help="cookies.txt (Netscape format); the fix for 'sign in to confirm you're not a bot'",
+    )
+    run.add_argument("--cookies-from-browser", help="read cookies from a logged-in browser, e.g. chrome / firefox")
+    run.add_argument(
+        "--no-playlist",
+        action="store_true",
+        help="for a watch?v=...&list=... URL take only that video, not the playlist",
+    )
+    run.add_argument(
+        "--player-clients",
+        help="comma-separated YouTube clients to try per video, in order "
+        "(default: default,tv_simply,web_safari,android_vr,ios,mweb)",
+    )
     run.add_argument("--out", type=Path, required=True, help="dataset output directory")
     run.add_argument("--config", type=Path, help="YAML config (defaults to configs/default.yaml)")
     run.add_argument("--workers", type=int, help="parallel downloads")
@@ -62,7 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--keep-intermediates",
         action="store_true",
-        help="keep each video's raw download and working WAVs (~0.5 GB per source hour)",
+        help="keep each video's raw download, working WAVs, captions and info JSON (~0.5 GB per source hour)",
+    )
+    run.add_argument(
+        "--keep-mp3",
+        action="store_true",
+        help="keep a full-length archival mp3 per video (~27 MB each); deleted with the rest by default",
     )
 
     # Common threshold overrides, so tuning does not require editing YAML.
@@ -120,8 +141,18 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         mapping["diarize.drop_overlap"] = False
     if args.keep_intermediates:
         mapping["runtime.keep_intermediates"] = True
+    if args.keep_mp3:
+        mapping["audio.keep_mp3"] = True
     if getattr(args, "languages", None):
         mapping["asr.languages"] = [lang.strip() for lang in args.languages.split(",") if lang.strip()]
+    if getattr(args, "no_playlist", False):
+        mapping["download.follow_playlist"] = False
+    if getattr(args, "cookies", None):
+        mapping["download.cookies_file"] = str(args.cookies)
+    if getattr(args, "cookies_from_browser", None):
+        mapping["download.cookies_from_browser"] = args.cookies_from_browser
+    if getattr(args, "player_clients", None):
+        mapping["download.player_clients"] = [c.strip() for c in args.player_clients.split(",") if c.strip()]
     return {k: v for k, v in mapping.items() if v is not None}
 
 
@@ -152,6 +183,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"\n{len(failed)} video(s) failed:")
         for r in failed:
             print(f"  {r.video_id}: {r.error}")
+        print(f"\nretry them with:  yt2ds run --urls-file {ws.failed} --out {ws.root}")
     return 1 if failed and kept == 0 else 0
 
 

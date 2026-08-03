@@ -12,8 +12,9 @@ audio:
   # Per-video EBU R128 loudness target. Applied per video, not per chunk, so
   # relative dynamics between chunks survive.
   target_lufs: -23.0
-  # Write an archival mp3 of the full audio next to the raw download.
-  keep_mp3: true
+  # Write and keep an archival mp3 of the full audio. Off by default: nothing
+  # downstream reads it, and at ~27 MB per video it outgrows the dataset.
+  keep_mp3: false
   # Set true to cut chunks from the mp3 instead of the lossless decode.
   # Lossy; off by default. See README "MP3 note".
   chunk_from_mp3: false
@@ -26,7 +27,18 @@ download:
   # yt-dlp retries and rate limiting.
   retries: 5
   sleep_interval: 1
+  socket_timeout: 30
+  # Cookies. A datacentre IP eventually trips YouTube's bot check; an exported
+  # cookies.txt from a logged-in session is what gets past it.
   cookies_from_browser: null
+  cookies_file: null
+  # Each entry is a full retry of the video under a different YouTube client.
+  # A 403 or a bot check is a property of the client that was answered, so
+  # asking as something else fixes what plain retries cannot.
+  player_clients: ["default", "tv_simply", "web_safari", "android_vr", "ios", "mweb"]
+  attempt_backoff: 4.0
+  # Live and upcoming streams have no stable audio; skip rather than fail.
+  skip_live: true
 
 vad:
   threshold: 0.5

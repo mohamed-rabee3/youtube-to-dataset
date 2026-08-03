@@ -22,7 +22,10 @@ class AudioConfig:
     work_sample_rate: int = 16000
     demucs_sample_rate: int = 44100
     target_lufs: float = -23.0
-    keep_mp3: bool = True
+    # Off by default: nothing downstream reads the MP3, and at ~27 MB per
+    # video an archive of a long run costs more disk than the dataset it
+    # accompanies. Turn it on to keep a full-length copy of each source.
+    keep_mp3: bool = False
     chunk_from_mp3: bool = False
 
 
@@ -34,6 +37,24 @@ class DownloadConfig:
     retries: int = 5
     sleep_interval: int = 1
     cookies_from_browser: str | None = None
+    # Netscape-format cookies.txt. The single most effective fix for
+    # "Sign in to confirm you're not a bot" on a datacentre IP.
+    cookies_file: str | None = None
+    # YouTube answers each of its own clients differently: the one that gets a
+    # 403 on fragments or a bot check is often not the one that succeeds. Each
+    # entry is a whole fresh attempt at the video; "default" is yt-dlp's own
+    # client choice. Order matters -- cheapest and most reliable first.
+    player_clients: list[str] = field(
+        default_factory=lambda: ["default", "tv_simply", "web_safari", "android_vr", "ios", "mweb"]
+    )
+    # Seconds to wait after a failed attempt, multiplied by the attempt number.
+    attempt_backoff: float = 4.0
+    socket_timeout: int = 30
+    # Live and upcoming streams have no stable audio to cut a dataset from.
+    skip_live: bool = True
+    # A `watch?v=...&list=...` URL expands to the whole playlist, as yt-dlp
+    # itself does. Set false (`--no-playlist`) to take only the named video.
+    follow_playlist: bool = True
 
 
 @dataclass

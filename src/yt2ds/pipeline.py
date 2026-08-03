@@ -86,14 +86,16 @@ class Pipeline:
         # of the run. Downloads run a little ahead so the GPU is not left
         # waiting on the network.
         for position, (url, assets) in enumerate(self._stream_downloads(pending), start=1):
-            if assets is None:
+            if assets is None or assets.error:
                 results.append(
                     VideoResult(
-                        video_id=download.video_id_from_url(url) or "unknown",
+                        video_id=(assets.video_id if assets else None) or download.video_id_from_url(url) or "unknown",
                         url=url,
-                        error="download failed",
+                        error=assets.error if assets else "download failed",
                     )
                 )
+                self._write_failed(results)
+                self._write_manifest(results)
                 continue
 
             log.info("[%d/%d] %s -- %s", position, len(pending), assets.video_id, assets.title or url)
@@ -105,9 +107,25 @@ class Pipeline:
             # The manifest is rewritten after every video, so a run that is
             # interrupted still describes what it managed to finish.
             self._write_manifest(results)
+            self._write_failed(results)
 
         self._write_manifest(results)
+        self._write_failed(results)
         return results
+
+    def _write_failed(self, results: list[VideoResult]) -> None:
+        """List the URLs that did not make it, ready to be fed back in.
+
+        A failed video saves no state, so `--urls-file failed.txt` on the next
+        run retries exactly those and nothing else. Removed when the list is
+        empty, so its presence is the signal.
+        """
+        failed = [r for r in results if r.error]
+        if not failed:
+            self.ws.failed.unlink(missing_ok=True)
+            return
+        lines = [f"# {r.video_id}: {r.error}\n{r.url}" for r in failed]
+        self.ws.failed.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def _already_done(self, video_id: str, url: str) -> VideoResult:
         """Rebuild a result from saved state, without downloading anything."""
@@ -157,10 +175,13 @@ class Pipeline:
             assets = download.download(url, self.ws, self.cfg)
         except Exception as exc:  # noqa: BLE001
             log.error("download error for %s: %s", url, exc)
-            return None
+            return download.VideoAssets(
+                video_id=download.video_id_from_url(url) or "unknown",
+                url=url,
+                error=str(exc),
+            )
         if assets.error:
             log.error("%s: %s", url, assets.error)
-            return None
         return assets
 
     # ------------------------------------------------------------------
@@ -429,19 +450,37 @@ class Pipeline:
         self._cleanup(assets, prepared)
 
     def _cleanup(self, assets: download.VideoAssets, prepared: audio.PreparedAudio) -> None:
-        """Delete this video's raw download and working WAVs.
+        """Delete everything this video needed but the dataset does not.
 
-        These dominate disk use -- a 48 kHz and a 16 kHz master run about
-        0.5 GB per source hour together -- and nothing reads them once the
-        video is finished. The MP3, the subtitles, the speaker centroids and
-        the state file all stay, so `report --link-speakers` and resume still
-        work on a dataset built over many runs.
+        Once the clips are written and their transcripts are in
+        `metadata.jsonl`, nothing reads the source material again: the download,
+        the two decoded masters, the caption file and the info JSON are all
+        spent. They dominate disk use -- roughly 0.5 GB per source hour for the
+        masters alone -- so a thousand-video run that kept them would need more
+        space for its scratch than for its output.
+
+        The MP3 goes with them unless `audio.keep_mp3` asks for the archive.
+        What survives is the deliverable plus the speaker centroids and the
+        state file, so `report --link-speakers` and resume still work on a
+        dataset built over many runs.
         """
         if self.cfg.runtime.keep_intermediates:
             return
 
+        spent: list[Path | None] = [
+            assets.audio_path,
+            prepared.master_path,
+            prepared.work_path,
+            assets.sub_path,
+            self.ws.raw / f"{assets.video_id}.info.json",
+        ]
+        if not self.cfg.audio.keep_mp3:
+            # `prepared.mp3_path` is None when no MP3 was written at all; name
+            # the file anyway so an archive left by an earlier run also goes.
+            spent.append(prepared.mp3_path or self.ws.mp3 / f"{assets.video_id}.mp3")
+
         freed = 0
-        for path in (assets.audio_path, prepared.master_path, prepared.work_path):
+        for path in spent:
             if path is None:
                 continue
             try:
@@ -450,7 +489,7 @@ class Pipeline:
             except OSError:  # already gone, or held open -- not worth failing over
                 continue
         if freed:
-            log.debug("%s: freed %.0f MB of intermediates", assets.video_id, freed / 1e6)
+            log.info("%s: freed %.0f MB", assets.video_id, freed / 1e6)
 
     def _write_manifest(self, results: list[VideoResult]) -> None:
         write_json(

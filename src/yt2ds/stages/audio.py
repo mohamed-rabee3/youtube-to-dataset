@@ -96,7 +96,10 @@ def prepare(assets: VideoAssets, ws: Workspace, cfg: Config) -> PreparedAudio:
     work_sr = cfg.audio.work_sample_rate
     master = ws.audio / f"{assets.video_id}.{master_sr // 1000}k.wav"
     work = ws.audio / f"{assets.video_id}.{work_sr // 1000}k.wav"
-    mp3 = ws.mp3 / f"{assets.video_id}.mp3" if cfg.audio.keep_mp3 else None
+    # An MP3 is written when it is wanted as an archive, or when chunks are to
+    # be cut from it. In the second case the pipeline deletes it afterwards.
+    want_mp3 = cfg.audio.keep_mp3 or cfg.audio.chunk_from_mp3
+    mp3 = ws.mp3 / f"{assets.video_id}.mp3" if want_mp3 else None
 
     needed = [p for p in (master, work) if not p.exists()]
     if mp3 is not None and not mp3.exists():

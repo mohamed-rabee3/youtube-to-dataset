@@ -44,6 +44,11 @@ class Workspace:
     def manifest(self) -> Path:
         return self.root / "manifest.json"
 
+    @property
+    def failed(self) -> Path:
+        """URLs that failed, in `--urls-file` format so they can be re-fed."""
+        return self.root / "failed.txt"
+
     # -- intermediates ---------------------------------------------------
     @property
     def work(self) -> Path:
