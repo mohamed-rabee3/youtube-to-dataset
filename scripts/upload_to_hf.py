@@ -13,6 +13,11 @@ Audio is embedded in the parquet under a ``datasets.Audio`` feature, so the repo
 loads with ``load_dataset(repo)`` and the Hub viewer works. The alternative --
 77k loose WAVs in one folder -- uploads far slower and defeats the viewer.
 
+Incremental: a repo already pushed at N rows is topped up with what the pipeline
+added since by passing ``--skip N --name-offset M``, where M is the number of
+shards already in the repo, so the new shards number on from the last one instead
+of overwriting it.
+
 Resumable: shards already present in the repo are skipped, so an interrupted run
 is restarted by re-running the same command. That only holds if the shard plan
 is unchanged, and the plan is derived from ``metadata.jsonl``, which grows while
@@ -67,6 +72,7 @@ FEATURES = Features(
         "align_score": Value("float64"),
         "aligned_words": Value("int32"),
         "boundary_clipped": Value("bool"),
+        "vocals_isolated": Value("bool"),
         "music_score": Value("float64"),
         "music_label": Value("string"),
         "speech_score": Value("float64"),
@@ -86,19 +92,22 @@ FEATURES = Features(
         "lufs": Value("float64"),
         "sample_rate": Value("int32"),
         "language": Value("string"),
+        # Written by scripts/diacritize.py; null on rows it could not diacritize.
+        "tashkeel_ratio": Value("float64"),
+        "tashkeel_source": Value("string"),
     }
 )
 SCHEMA = FEATURES.arrow_schema
 COLUMNS = [name for name in SCHEMA.names if name != "audio"]
 
 
-def read_rows(root: Path, limit: int | None):
+def read_rows(root: Path, limit: int | None, skip: int = 0):
     with open(root / "metadata.jsonl", encoding="utf-8") as fh:
-        for line in islice(fh, limit):
+        for line in islice(fh, skip, limit):
             yield json.loads(line)
 
 
-def plan_shards(root: Path, limit: int | None, target_bytes: int):
+def plan_shards(root: Path, limit: int | None, target_bytes: int, skip: int = 0):
     """Assign every row to a shard up front, so shard names can carry the total."""
     wavs = root / "wavs"
     shards: list[list[dict]] = []
@@ -106,7 +115,7 @@ def plan_shards(root: Path, limit: int | None, target_bytes: int):
     current_bytes = 0
     missing: list[str] = []
 
-    for row in read_rows(root, limit):
+    for row in read_rows(root, limit, skip):
         try:
             size = (wavs / row["audio_file"]).stat().st_size
         except FileNotFoundError:
@@ -168,6 +177,18 @@ def main() -> None:
         default=None,
         help="only the first N rows of metadata.jsonl; pin this to keep a resumed run's shard plan stable",
     )
+    parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help="drop the first N rows; use the row count of the previous push to send only what the pipeline added since",
+    )
+    parser.add_argument(
+        "--name-offset",
+        type=int,
+        default=0,
+        help="start shard numbering here instead of at 0, so a later push lands beside the shards already in the repo rather than overwriting them. Set it to the shard count already there. The name must stay train-NNNNN-of-NNNNN: the Hub reads anything else between 'train-' and the digits as part of the split name, and a split named 'train-part02' fails validation and takes the whole repo's viewer down with it",
+    )
     parser.add_argument("--shard-mb", type=int, default=450, help="target shard size before compression")
     parser.add_argument("--work-dir", type=Path, default=Path("/tmp/yt2ds-shards"))
     parser.add_argument("--private", action="store_true", help="create the repo private if it does not exist")
@@ -182,7 +203,7 @@ def main() -> None:
     api = HfApi(token=token)
     api.create_repo(args.repo, repo_type="dataset", private=args.private, exist_ok=True)
 
-    shards, missing = plan_shards(args.dataset, args.rows, args.shard_mb * 1024 * 1024)
+    shards, missing = plan_shards(args.dataset, args.rows, args.shard_mb * 1024 * 1024, args.skip)
     total = len(shards)
     print(f"{sum(len(s) for s in shards)} rows -> {total} shards; {len(missing)} missing wavs", flush=True)
     if missing:
@@ -190,7 +211,10 @@ def main() -> None:
 
     done = set(api.list_repo_files(args.repo, repo_type="dataset"))
     for index, shard in enumerate(shards):
-        remote = f"data/train-{index:05d}-of-{total:05d}.parquet"
+        # The 'of-NNNNN' half is only a label -- the loader globs, it does not
+        # check that the totals agree -- so an incremental push carries its own
+        # batch total rather than renaming what is already on the hub.
+        remote = f"data/train-{args.name_offset + index:05d}-of-{args.name_offset + total:05d}.parquet"
         if remote in done:
             print(f"[{index + 1}/{total}] {remote} already on the hub", flush=True)
             continue

@@ -12,7 +12,15 @@ license = { text = "Apache-2.0" }
 
 dependencies = [
     # torch/torchaudio are installed separately by scripts/setup.sh so the
-    # CUDA build can be pinned to the right index.
+    # CUDA build can be pinned to the right index. audio-separator (vocal
+    # isolation) is installed there too, with --no-deps: its bare `torch>=2.3`
+    # would otherwise pull a build without CUDA over the pinned one.
+    # Default ASR backend (asr.backend: google).
+    "google-cloud-speech>=2.27",
+    # asr.backend: google_batch uploads audio for V2 BatchRecognize, which
+    # only reads from Cloud Storage.
+    "google-cloud-storage>=2.18",
+    # The cohere ASR backend and the aligner.
     "transformers>=5.4",
     "accelerate>=1.1",
     "yt-dlp>=2026.7.4",

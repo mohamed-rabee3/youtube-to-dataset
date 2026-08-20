@@ -76,13 +76,23 @@ def normalize(text: str) -> str:
 def clean_for_output(text: str) -> str:
     """Light cleanup for the text stored in the dataset.
 
-    Keeps orthography and diacritics intact; only removes caption artefacts and
-    normalizes whitespace.
+    Keeps orthography and diacritics intact; only removes caption artefacts,
+    tatweel, and normalizes whitespace.
+
+    Tatweel (U+0640) is the one character dropped rather than preserved. It is
+    a typographic elongation that stretches the joining stroke and carries no
+    sound, so it is not orthography -- and a diacritizer asked for marks will
+    sometimes reach for it as somewhere to hang one, which would otherwise put
+    a silent character into a TTS training target. Note that it falls inside
+    the Arabic letter range, so leaving it in would also let it pose as a
+    word's final letter and shield a real case ending from
+    :func:`strip_final_tashkeel`.
     """
     if not text:
         return ""
     text = unicodedata.normalize("NFC", text)
     text = strip_caption_annotations(text)
+    text = text.replace(_TATWEEL, "")
     return _WS.sub(" ", text).strip()
 
 
@@ -98,6 +108,97 @@ def arabic_ratio(text: str) -> float:
     arabic = sum(1 for c in chars if _ARABIC_LETTER.match(c))
     return arabic / len(chars)
 
+
+# -- tashkeel -----------------------------------------------------------
+# A diacritized transcript is written for TTS, where the marks say how a word
+# is *pronounced*. Two rules follow from that and are enforced here in code
+# rather than trusted to whatever produced the marks:
+#
+# 1. No mark on a word's final letter. Arabic case endings (i'rab) are a
+#    grammatical property, not an audible one -- in ordinary speech the word
+#    is stopped on (waqf) and the ending is not voiced. Marking it teaches a
+#    TTS model to pronounce something the speaker never said.
+# 2. The letters themselves must not change. Adding marks is a strictly
+#    additive edit; if the bare skeleton moved, the text was rewritten rather
+#    than diacritized, and it can no longer be trusted against the audio.
+
+
+def strip_tashkeel(text: str) -> str:
+    """Remove every diacritic, leaving the bare consonantal skeleton."""
+    return _DIACRITICS.sub("", text or "")
+
+
+def has_tashkeel(text: str) -> bool:
+    return bool(_DIACRITICS.search(text or ""))
+
+
+def tashkeel_ratio(text: str) -> float:
+    """Diacritics per Arabic letter. Fully-marked prose sits near 0.8-1.0."""
+    letters = _ARABIC_LETTER.findall(strip_tashkeel(text))
+    if not letters:
+        return 0.0
+    return len(_DIACRITICS.findall(text or "")) / len(letters)
+
+
+def strip_final_tashkeel(text: str) -> str:
+    """Drop diacritics sitting on the last letter of each word (rule 1 above).
+
+    Operates on runs of Arabic letters and marks, so punctuation, Latin text
+    and whitespace pass through untouched. Marks *inside* a word are kept --
+    only the trailing letter is cleared, however many marks it carries.
+
+    One case needs more than "clear the last letter": tanwin fath is written
+    on the *penultimate* letter, with a silent alef after it (``مرحبًا``). It
+    is still a case ending and still inaudible in waqf, so it goes too. An
+    ordinary fatha in that position is part of the word and stays.
+    """
+    if not text:
+        return ""
+
+    def clear(match: re.Match) -> str:
+        word = match.group(0)
+        # Walk back over the trailing marks to the final real letter.
+        end = len(word)
+        while end > 0 and _DIACRITICS.match(word[end - 1]):
+            end -= 1
+        word = word[:end]
+        # ...then the tanwin-fath-plus-alef spelling of the same ending.
+        if len(word) >= 2 and word[-1] in _SILENT_TANWIN_ALEF and word[-2] == _TANWIN_FATH:
+            word = word[:-2] + word[-1]
+        return word
+
+    return _ARABIC_WORD.sub(clear, text)
+
+
+def same_skeleton(a: str, b: str) -> bool:
+    """True when two strings differ only by diacritics (rule 2 above)."""
+    return strip_tashkeel(a or "").split() == strip_tashkeel(b or "").split()
+
+
+def same_words(a: str, b: str) -> bool:
+    """True when two strings are the same words under orthographic variation.
+
+    Looser than :func:`same_skeleton`: hamza seats, ta marbuta, final ya and
+    punctuation may differ, nothing else. A diacritizer that also restores the
+    hamza a transcript was missing (``اصوات`` -> ``أصوات``) has improved the
+    text rather than rewritten it, and its marks are still trustworthy; one
+    that adds, drops or reorders a word has not.
+    """
+    left, right = normalize(a or "").split(), normalize(b or "").split()
+    return left == right and len(left) > 0
+
+
+# Built from explicit escapes rather than literal Arabic: typing the ranges
+# as characters lets bidi reordering silently fuse them into a much wider
+# class (one that swallowed "؟" into the preceding word).
+_TASHKEEL_CHARS = "\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED"
+_LETTER_CHARS = "\u0621-\u064A\u066E\u066F\u0671-\u06D5\u06EE\u06EF\u06FA-\u06FF"
+
+#: A word for tashkeel purposes: Arabic letters with their marks, nothing else.
+_ARABIC_WORD = re.compile(f"[{_LETTER_CHARS}][{_LETTER_CHARS}{_TASHKEEL_CHARS}]*")
+
+_TANWIN_FATH = "\u064B"
+_SILENT_TANWIN_ALEF = ("\u0627", "\u0649")  # alef, alef maqsura
 
 _LATIN_LETTER = re.compile(r"[A-Za-z0-9]")
 

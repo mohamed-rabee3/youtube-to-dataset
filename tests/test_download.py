@@ -233,3 +233,45 @@ class TestClientSequence:
     def test_empty_falls_back_to_default(self, cfg):
         cfg.download.player_clients = []
         assert dl._client_sequence(cfg) == ["default"]
+
+
+class TestLocalSources:
+    """A corpus already on disk goes through the same pipeline, minus the fetch."""
+
+    def test_url_is_not_a_path(self):
+        assert dl.local_source("https://www.youtube.com/watch?v=abc123") is None
+
+    def test_missing_path_is_not_a_source(self, tmp_path):
+        assert dl.local_source(str(tmp_path / "nope.mp3")) is None
+
+    def test_existing_file_is_a_source(self, tmp_path):
+        audio = tmp_path / "1.mp3"
+        audio.write_bytes(b"")
+        assert dl.local_source(str(audio)) == audio
+
+    def test_directory_expands_in_natural_order(self, tmp_path):
+        for name in ("10.mp3", "2.mp3", "1.mp3", "notes.txt"):
+            (tmp_path / name).write_bytes(b"")
+        assert [p.name for p in dl.expand_local(tmp_path)] == ["1.mp3", "2.mp3", "10.mp3"]
+
+    def test_expand_urls_mixes_local_and_remote(self, tmp_path, cfg, monkeypatch):
+        (tmp_path / "a.mp3").write_bytes(b"")
+        monkeypatch.setattr(
+            dl,
+            "_extract",
+            lambda *a, **k: ({"_type": "video", "id": "abc123"}, None),
+        )
+        got = dl.expand_urls([str(tmp_path), "https://youtu.be/abc123"], cfg)
+        assert got == [str((tmp_path / "a.mp3").resolve()), "https://www.youtube.com/watch?v=abc123"]
+
+    def test_assets_carry_the_local_flag(self, tmp_path):
+        audio = tmp_path / "07 clip.mp3"
+        audio.write_bytes(b"")
+        assets = dl.local_assets(audio)
+        assert assets.is_local and assets.audio_path == audio.resolve()
+        assert assets.video_id == "07_clip" and assets.sub_path is None
+
+    def test_source_id_matches_for_resume(self, tmp_path):
+        audio = tmp_path / "3.mp3"
+        audio.write_bytes(b"")
+        assert dl.source_id(str(audio)) == dl.local_assets(audio).video_id == "3"

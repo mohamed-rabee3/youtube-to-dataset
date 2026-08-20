@@ -1,4 +1,10 @@
-"""Reject chunks containing music or non-speech noise.
+"""Score chunks for music and non-speech noise.
+
+By default this only *measures*. ``separate.py`` has already pulled the music
+bed out of the speech by the time these detectors run, so what they see is the
+residue the isolator left behind -- worth recording per chunk, not worth
+throwing a usable voice away over. Set ``music.reject`` to restore the old
+behaviour, where either detector firing drops the chunk.
 
 Two independent detectors, because each misses what the other catches:
 
@@ -10,8 +16,11 @@ Two independent detectors, because each misses what the other catches:
   catches applause, crowd noise, and pure-music passages that Demucs might
   attribute to "vocals" when someone is singing.
 
-A chunk is dropped if either detector fires. Scores are recorded either way, so
-thresholds can be re-tuned against ``rejected.jsonl`` without recomputing.
+Scoring is all this does by default. ``separate.py`` has already pulled the
+music bed out of the speech by the time these run, so what they see is the
+residue the isolator left behind -- worth recording per chunk, not worth
+throwing a usable voice away over. Set ``music.reject`` to restore the older
+behaviour, where either detector firing drops the chunk.
 """
 
 from __future__ import annotations
@@ -42,6 +51,9 @@ def score_batch(
         return
     _score_demucs(items, sr, cfg, registry)
     _score_ast(items, sr, cfg, registry)
+
+    if not cfg.music.reject:
+        return
 
     for chunk, _ in items:
         ratio = chunk.scores.get("accompaniment_ratio")

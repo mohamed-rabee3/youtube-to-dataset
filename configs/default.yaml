@@ -52,6 +52,9 @@ diarize:
   drop_overlap: true
   # Guard against a diarizer that split one voice into many clusters.
   collapse_single_speaker_ratio: 0.9
+  # 0 keeps the model config's own batch size (32), halved on each OOM retry.
+  # Set it low outright if the GPU is shared with something else.
+  batch_size: 0
 
 segment:
   min_duration: 2.0
@@ -64,7 +67,31 @@ segment:
   # provided the pause is at least this long.
   min_split_pause: 0.25
 
+separate:
+  # Pull the music bed out of the speech, over the whole video, before
+  # anything is segmented or measured. Speech under a soundtrack then lands in
+  # the dataset as speech instead of being dropped as music.
+  enabled: true
+  # Mel-Band RoFormer (Kim, FT by unwa): 11.53 dB vocal SDR on MUSDB against
+  # 11.63 for the best BS-Roformer and 9.24 for htdemucs, at twice the speed
+  # of the BS-Roformer. Any audio-separator model filename works here; see
+  # `python -m audio_separator.utils.cli --list_models`.
+  model: "mel_band_roformer_kim_ft_unwa.ckpt"
+  model_dir: ".cache/audio-separator"
+  stem: "Vocals"
+  # Inference window and overlap. Defaults; raise batch_size for speed if the
+  # card has room.
+  segment_size: 256
+  overlap: 8
+  batch_size: 1
+  # Keep the untouched decode beside the isolated voice, for comparison.
+  keep_original: false
+
 music:
+  # Whether a musical chunk is dropped, or only scored. Off, because the music
+  # is now removed rather than the chunk -- the thresholds below then apply to
+  # the residue the isolator left. Set true for the old drop-the-chunk gate.
+  reject: false
   # Demucs vocals-vs-accompaniment energy. Above this, the chunk has too much
   # music behind the speech.
   max_accompaniment_ratio: 0.10
@@ -94,14 +121,78 @@ speakers:
   min_speaker_seconds: 30.0
 
 asr:
-  model: "CohereLabs/cohere-transcribe-arabic-07-2026"
-  # The model has no auto-detect: it decodes under a language prompt. Each
-  # chunk is decoded once per language here and the higher-confidence result
-  # wins, so English segments come out as English instead of being forced into
-  # invented Arabic. Arabic-English code-switching *within* a chunk is handled
-  # by the model under whichever prompt scores better.
-  # Set to ["ar"] alone to halve ASR time on Arabic-only material.
+  # "google" -- Cloud Speech-to-Text. The default: no GPU, no 2B model
+  #             resident, and stronger on Saudi/Gulf dialect than a general
+  #             model. Needs credentials and is billed per audio minute.
+  # "cohere"  -- Cohere Transcribe Arabic, run locally on the GPU. No API key,
+  #             no network, no per-minute cost. `--asr-backend cohere`.
+  backend: "google"
+  # On google: the first entry is the primary language and the rest are sent
+  # as alternatives the API detects among, so a chunk costs one request either
+  # way. On cohere there is no auto-detect -- the model decodes under a
+  # language prompt, so each chunk is decoded once per language here and the
+  # higher-confidence result wins, which is what stops English segments being
+  # forced into invented Arabic. Either way, set to ["ar"] alone for
+  # Arabic-only material; on cohere that halves ASR time.
   languages: ["ar", "en"]
+
+  google:
+    # Google's general long-form model. "latest_short", "chirp_2" and the rest
+    # of the v1 model names are also accepted.
+    model: "latest_long"
+    # Short code (as written in `languages` above) -> the BCP-47 locale the
+    # API wants. A code that is not listed is passed through unchanged, so
+    # `languages` can also name a locale directly.
+    locales:
+      ar: "ar-SA"
+      en: "en-US"
+    # Send languages[1:] as alternative_language_codes (max 3). Turned off
+    # automatically for the rest of the run if the chosen model rejects them.
+    use_alternative_languages: true
+    enable_automatic_punctuation: true
+    profanity_filter: false
+    # Chunks are 2-12 s, so this is one small request each -- concurrency is
+    # what keeps that from dominating the run. Raise if the quota allows.
+    max_workers: 8
+    max_retries: 4
+    # Seconds before the first retry, doubled each attempt.
+    retry_backoff: 2.0
+    timeout: 60.0
+    # Service-account JSON. Unset falls back to GOOGLE_APPLICATION_CREDENTIALS
+    # and then to application default credentials.
+    credentials_file: null
+
+  # -- google_batch backend only --
+  # Whole-episode transcription through Speech-to-Text V2 BatchRecognize. The
+  # per-chunk backends are billed per request rounded up to 15 seconds, and
+  # chunks here average under 5, so a corpus transcribed clip by clip is billed
+  # for about three times the audio it holds. One request per episode is billed
+  # for its real length, and the word timings that come back replace both the
+  # per-chunk requests and the forced-alignment pass.
+  google_batch:
+    # ar-SA is served by "long" only in "global" and "us" -- NOT us-central1,
+    # where the request is rejected outright, and no Chirp model offers ar-SA
+    # at all (only ar-EG). Verified against the live API.
+    location: "global"
+    # V2's name for what v1 called "latest_long".
+    model: "long"
+    language_codes: ["ar-SA"]
+    # Batch recognition only reads from Cloud Storage; without a bucket the
+    # backend cannot run. Override per run with `yt2ds transcribe --bucket`.
+    bucket: null
+    prefix: "yt2ds"
+    keep_uploads: true
+    # The discounted tier: about a quarter of the standard per-minute price for
+    # a latency SLA of up to 24 hours. Measured turnaround has been seconds.
+    dynamic_batching: true
+    enable_automatic_punctuation: true
+    enable_word_confidence: true
+    max_workers: 16
+    upload_workers: 8
+    timeout: 14400.0
+
+  # -- cohere backend only --
+  model: "CohereLabs/cohere-transcribe-arabic-07-2026"
   batch_size: 8
   max_new_tokens: 256
   dtype: "bfloat16"
@@ -128,8 +219,10 @@ quality:
 
 filters:
   # The fidelity gate: character error rate between the YouTube subtitle text
-  # and Cohere's transcription of the same chunk. Above this they disagree too
-  # much to trust either, so the chunk is dropped.
+  # and the ASR backend's transcription of the same chunk. Above this they
+  # disagree too much to trust either, so the chunk is dropped. (The key name
+  # predates the Google backend; datasets built before it keep the same
+  # column.)
   max_cer_yt_vs_cohere: 0.35
   # Calibrated for Arabic script, which is far more compact than Latin:
   # measured Saudi podcast speech runs 5.4-12.8 chars/sec, median 9.5.
@@ -142,10 +235,14 @@ filters:
   # chunk was decoded in: Arabic for "ar", Latin for "en". Code-switched
   # speech still passes, since this is a proportion and not a purity test.
   min_script_ratio: 0.6
-  # Mean per-token log-probability floor for the transcript. Applied only when
-  # a video had no subtitles, because then the model's own confidence is the
-  # only guard against a hallucinated transcript.
+  # Confidence floor for the transcript, applied only when a video had no
+  # subtitles -- then the model's own confidence is the only guard against a
+  # hallucinated transcript. The backends score on different scales, so they
+  # get separate floors: cohere reports a mean per-token log-probability
+  # (<= 0), google its own 0-1 confidence. Whichever produced the text picks
+  # the floor.
   min_asr_confidence: -1.0
+  min_asr_confidence_google: 0.5
   # A word whose forced-aligned span is cut by the chunk boundary means the
   # transcript does not match the audio in the clip.
   drop_boundary_clipped_words: true

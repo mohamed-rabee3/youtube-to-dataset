@@ -61,13 +61,20 @@ def compute_overlaps(turns: list[dict]) -> list[dict]:
     return merged
 
 
-def diarize(wav: Path, model_id: str, device: str) -> dict:
+def diarize(wav: Path, model_id: str, device: str, batch_size: int = 0) -> dict:
     import torch
     from diarizen.pipelines.inference import DiariZenPipeline
 
     pipeline = DiariZenPipeline.from_pretrained(model_id)
     if device.startswith("cuda") and torch.cuda.is_available():
         pipeline.to(torch.device(device))
+
+    # The model's own config.toml picks the batch size (32), which assumes it
+    # has the GPU to itself. It does not: the parent process keeps its models
+    # resident across videos. A smaller batch trades speed for fitting.
+    if batch_size > 0:
+        pipeline.segmentation_batch_size = batch_size
+        pipeline.embedding_batch_size = batch_size
 
     annotation = pipeline(str(wav))
 
@@ -92,6 +99,12 @@ def main() -> int:
     parser.add_argument("output", type=Path)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="segmentation/embedding batch size; 0 keeps the model config's own (32)",
+    )
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -99,7 +112,7 @@ def main() -> int:
         return 2
 
     try:
-        result = diarize(args.input, args.model, args.device)
+        result = diarize(args.input, args.model, args.device, args.batch_size)
     except Exception as exc:  # noqa: BLE001 - report cleanly to the parent process
         print(f"diarization failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

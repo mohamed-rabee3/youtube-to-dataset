@@ -1,4 +1,8 @@
-"""Transcribe chunks with Cohere Transcribe Arabic.
+"""Transcribe chunks with Cohere Transcribe Arabic (``asr.backend: cohere``).
+
+The local GPU alternative to the default Google backend: no API key, no
+per-minute billing and no network, at the cost of a 2B model resident on the
+card and roughly real-time decoding.
 
 The model emits no timestamps, which is precisely why the pipeline segments
 first and transcribes second: each chunk is already a 2-12 second clip, so the

@@ -78,6 +78,16 @@ class Workspace:
     def embeddings(self) -> Path:
         return self.work / "embeddings"
 
+    @property
+    def asr_audio(self) -> Path:
+        """Per-episode FLAC awaiting upload for batch transcription."""
+        return self.work / "asr-audio"
+
+    @property
+    def asr_words(self) -> Path:
+        """Word timings returned by batch transcription, cached per episode."""
+        return self.work / "asr-words"
+
     def create(self) -> "Workspace":
         for d in (
             self.root,
@@ -89,6 +99,8 @@ class Workspace:
             self.subs,
             self.state,
             self.embeddings,
+            self.asr_audio,
+            self.asr_words,
         ):
             d.mkdir(parents=True, exist_ok=True)
         return self

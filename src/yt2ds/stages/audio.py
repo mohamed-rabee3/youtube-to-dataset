@@ -48,6 +48,11 @@ class PreparedAudio:
     # the configured target. Applied when chunks are written.
     lufs: float
     gain_db: float
+    # Set once vocal isolation has run: `master_path` and `work_path` then
+    # point at the isolated voice, and these at the untouched decode.
+    separated: bool = False
+    source_master_path: Path | None = None
+    source_work_path: Path | None = None
 
 
 class FfmpegError(RuntimeError):
@@ -116,7 +121,7 @@ def prepare(assets: VideoAssets, ws: Workspace, cfg: Config) -> PreparedAudio:
         _run(cmd)
 
     duration = probe_duration(master)
-    lufs, gain_db = _measure_loudness(work, work_sr, cfg.audio.target_lufs)
+    lufs, gain_db = measure_loudness(work, cfg.audio.target_lufs)
 
     return PreparedAudio(
         video_id=assets.video_id,
@@ -131,8 +136,13 @@ def prepare(assets: VideoAssets, ws: Workspace, cfg: Config) -> PreparedAudio:
     )
 
 
-def _measure_loudness(path: Path, sr: int, target_lufs: float) -> tuple[float, float]:
-    """Integrated loudness (ITU-R BS.1770) and the gain to reach the target."""
+def measure_loudness(path: Path, target_lufs: float) -> tuple[float, float]:
+    """Integrated loudness (ITU-R BS.1770) and the gain to reach the target.
+
+    Re-measured after vocal isolation: pulling the music bed out drops the
+    integrated loudness of a scene by several LU, and the gain applied at emit
+    time has to be the one that suits the voice that is actually kept.
+    """
     import pyloudnorm
     import soundfile as sf
 

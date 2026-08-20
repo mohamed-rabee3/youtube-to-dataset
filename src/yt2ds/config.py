@@ -70,6 +70,9 @@ class DiarizeConfig:
     model: str = "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
     drop_overlap: bool = True
     collapse_single_speaker_ratio: float = 0.9
+    # Segmentation/embedding batch size for the worker. 0 keeps the model
+    # config's own (32), which is halved on each retry after an OOM.
+    batch_size: int = 0
 
 
 @dataclass
@@ -82,7 +85,34 @@ class SegmentConfig:
 
 
 @dataclass
+class SeparateConfig:
+    """Vocal isolation: take the music out of the speech, keep the speech."""
+
+    enabled: bool = True
+    # audio-separator model filename. Mel-Band RoFormer (Kim, FT by unwa) sits
+    # within 0.1 dB of the best vocal SDR on MUSDB (11.53 vs 11.63 for
+    # BS-Roformer-1296) and separates about twice as fast; both are ~2.3 dB
+    # ahead of the htdemucs the music *detector* uses.
+    model: str = "mel_band_roformer_kim_ft_unwa.ckpt"
+    # Where model weights are cached. ~640 MB for the default model.
+    model_dir: str = ".cache/audio-separator"
+    # The stem to keep. "Vocals" is the model's name for the voice.
+    stem: str = "Vocals"
+    # These models run at 44.1 kHz; the isolated voice is resampled back to
+    # the pipeline's 48 kHz master and 16 kHz working rates.
+    segment_size: int = 256
+    overlap: int = 8
+    batch_size: int = 1
+    # Keep the untouched master beside the isolated voice. Off by default:
+    # nothing downstream reads it once separation has run.
+    keep_original: bool = False
+
+
+@dataclass
 class MusicConfig:
+    # Whether a musical chunk is dropped. Off by default, because separation
+    # removes the music rather than the chunk; the scores are still recorded.
+    reject: bool = False
     max_accompaniment_ratio: float = 0.10
     ast_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
     max_music_score: float = 0.20
@@ -112,11 +142,92 @@ class SpeakersConfig:
 
 
 @dataclass
+class GoogleAsrConfig:
+    """Google Cloud Speech-to-Text, the default transcription backend."""
+
+    # "latest_long" is Google's general long-form model. "latest_short",
+    # "chirp_2" and the rest are also accepted; whatever the v1 API takes.
+    model: str = "latest_long"
+    # Short language code (as used in asr.languages) -> BCP-47 locale, which
+    # is what the API actually wants. Anything not listed is sent through
+    # unchanged, so asr.languages can also name a locale directly.
+    locales: dict[str, str] = field(default_factory=lambda: {"ar": "ar-SA", "en": "en-US"})
+    # Unlike Cohere, the API detects among languages itself: the first entry
+    # of asr.languages is the primary and the rest go in as alternatives, so
+    # each chunk costs one request rather than one per language.
+    use_alternative_languages: bool = True
+    enable_automatic_punctuation: bool = True
+    profanity_filter: bool = False
+    # Chunks are 2-12 s, so this is one small request each. Concurrency is
+    # what makes that tolerable; raise it if the quota allows.
+    max_workers: int = 8
+    max_retries: int = 4
+    # Seconds before the first retry, doubled each attempt.
+    retry_backoff: float = 2.0
+    timeout: float = 60.0
+    # Service-account JSON. Unset falls back to GOOGLE_APPLICATION_CREDENTIALS
+    # and then to application default credentials.
+    credentials_file: str | None = None
+
+
+@dataclass
+class GoogleBatchConfig:
+    """Speech-to-Text **V2** BatchRecognize, whole-episode and off the GPU.
+
+    The per-chunk backends pay twice over: Google bills each request rounded up
+    to 15 seconds, and chunks here average under 5, so a corpus transcribed
+    clip by clip is billed for roughly three times the audio it contains.
+    Sending the whole episode instead is billed for its true length, and the
+    word-level timestamps that come back are enough to cut the transcript into
+    the chunks the diarizer already decided on -- so the per-chunk requests, and
+    the forced-alignment pass that would otherwise place the words, both go.
+
+    ``DYNAMIC_BATCHING`` is the discounted tier: about a quarter of the standard
+    per-minute price, in exchange for a latency SLA of up to 24 hours. In
+    practice it has returned in seconds.
+    """
+
+    # ar-SA is served by "long" only in the "global" and "us" locations -- not
+    # us-central1, and no Chirp model offers it at all. Verified against the
+    # live API; see README. "long" is the V2 name for v1's "latest_long".
+    location: str = "global"
+    model: str = "long"
+    language_codes: list[str] = field(default_factory=lambda: ["ar-SA"])
+    # Batch recognition only reads from Cloud Storage, so audio is uploaded
+    # first. Unset means the backend cannot run.
+    bucket: str | None = None
+    # Prefix inside the bucket for uploaded audio and returned transcripts.
+    prefix: str = "yt2ds"
+    # Keep the uploaded audio after a successful run, so re-transcribing under
+    # a different model costs no second upload.
+    keep_uploads: bool = True
+    # Trade the discounted tier for the standard one by setting this false.
+    dynamic_batching: bool = True
+    enable_automatic_punctuation: bool = True
+    enable_word_confidence: bool = True
+    # One episode per request, many requests in flight: the API caps how much
+    # it will return inline, and one file per request keeps the mapping from
+    # transcript back to episode trivial.
+    max_workers: int = 16
+    upload_workers: int = 8
+    # A 90-minute episode is well inside this; it is the guard against a
+    # request that never settles.
+    timeout: float = 14400.0
+
+
+@dataclass
 class AsrConfig:
-    model: str = "CohereLabs/cohere-transcribe-arabic-07-2026"
+    # "google" (per-chunk Cloud Speech-to-Text v1), "google_batch" (whole-episode
+    # V2 BatchRecognize, filled in by `yt2ds transcribe`), or "cohere" (local 2B
+    # GPU model).
+    backend: str = "google"
     # Decoded once per language; highest-confidence result wins. See
     # configs/default.yaml for why this is not auto-detected.
     languages: list[str] = field(default_factory=lambda: ["ar", "en"])
+    google: GoogleAsrConfig = field(default_factory=GoogleAsrConfig)
+    google_batch: GoogleBatchConfig = field(default_factory=GoogleBatchConfig)
+    # -- cohere backend only --
+    model: str = "CohereLabs/cohere-transcribe-arabic-07-2026"
     batch_size: int = 8
     max_new_tokens: int = 256
     dtype: str = "bfloat16"
@@ -152,9 +263,12 @@ class FiltersConfig:
     # Fraction of characters that must be in the script of the decoded
     # language (Arabic for "ar", Latin for "en").
     min_script_ratio: float = 0.6
-    # Mean per-token log-probability floor, applied only on the Cohere-only
-    # path where there is no second transcript to compare against.
+    # Confidence floor for the transcript, applied only on the ASR-only path
+    # where there is no second transcript to compare against. The two backends
+    # report on different scales and so get separate floors: Cohere's is a mean
+    # per-token log-probability (<= 0), Google's is its own 0-1 confidence.
     min_asr_confidence: float = -1.0
+    min_asr_confidence_google: float = 0.5
     drop_boundary_clipped_words: bool = True
 
 
@@ -177,6 +291,7 @@ class Config:
     vad: VadConfig = field(default_factory=VadConfig)
     diarize: DiarizeConfig = field(default_factory=DiarizeConfig)
     segment: SegmentConfig = field(default_factory=SegmentConfig)
+    separate: SeparateConfig = field(default_factory=SeparateConfig)
     music: MusicConfig = field(default_factory=MusicConfig)
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)

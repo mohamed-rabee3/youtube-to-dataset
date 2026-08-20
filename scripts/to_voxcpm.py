@@ -459,8 +459,11 @@ def main(argv=None) -> int:
     print(f"converting {len(jobs)} clips to {args.sample_rate} Hz mono with {args.workers} workers...")
     durations: dict[str, float] = {}
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        for i, (name, dur) in enumerate(pool.map(convert_clip, jobs, chunksize=16), 1):
-            durations[name] = dur
+        # Keyed off the row, not the returned filename: `audio_file` is a
+        # `<speaker>/<clip>.wav` path and only its basename comes back.
+        # `pool.map` preserves input order, so the zip stays aligned.
+        for i, ((_, dur), row) in enumerate(zip(pool.map(convert_clip, jobs, chunksize=16), kept), 1):
+            durations[row["audio_file"]] = dur
             if i % 250 == 0 or i == len(jobs):
                 print(f"  {i}/{len(jobs)}")
 

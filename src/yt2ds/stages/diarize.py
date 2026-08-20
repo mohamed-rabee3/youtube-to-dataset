@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..io import Workspace
+from ..models import ModelRegistry
 from .vad import Region
 
 log = logging.getLogger(__name__)
@@ -78,7 +79,13 @@ def is_available() -> bool:
     return worker_python().exists() and WORKER.exists()
 
 
-def run(work_path: Path, ws: Workspace, cfg: Config, video_id: str) -> Diarization:
+def run(
+    work_path: Path,
+    ws: Workspace,
+    cfg: Config,
+    video_id: str,
+    registry: ModelRegistry | None = None,
+) -> Diarization:
     """Diarize the 16 kHz working copy, caching the result on disk."""
     cache = ws.work / "diarization" / f"{video_id}.json"
     if cache.exists():
@@ -96,24 +103,69 @@ def run(work_path: Path, ws: Workspace, cfg: Config, video_id: str) -> Diarizati
         )
 
     cache.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(python),
-        str(WORKER),
-        str(work_path),
-        str(cache),
-        "--model",
-        cfg.diarize.model,
-        "--device",
-        cfg.runtime.device,
-    ]
     log.info("diarizing %s", video_id)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"diarization worker failed for {video_id}: {proc.stderr.strip()[-2000:]}")
-    if proc.stderr.strip():
-        log.info("diarizer: %s", proc.stderr.strip().splitlines()[-1])
 
-    return _parse(json.loads(cache.read_text(encoding="utf-8")))
+    # The worker is a separate process, so it only gets the GPU memory this one
+    # is not holding. Hand back the allocator's unused blocks first, or a long
+    # video -- whose scoring batches grew the cache to tens of gigabytes --
+    # starves the diarizer that follows it.
+    if registry is not None:
+        registry.free_cached_memory()
+
+    ladder = _batch_sizes(cfg)
+    last_error = ""
+    for attempt, batch_size in enumerate(ladder, start=1):
+        cmd = [
+            str(python),
+            str(WORKER),
+            str(work_path),
+            str(cache),
+            "--model",
+            cfg.diarize.model,
+            "--device",
+            cfg.runtime.device,
+        ]
+        if batch_size > 0:
+            cmd += ["--batch-size", str(batch_size)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            if proc.stderr.strip():
+                log.info("diarizer: %s", proc.stderr.strip().splitlines()[-1])
+            return _parse(json.loads(cache.read_text(encoding="utf-8")))
+
+        last_error = proc.stderr.strip()[-2000:]
+        if not _is_out_of_memory(last_error) or attempt >= len(ladder):
+            break
+        next_batch = ladder[attempt]
+        log.warning(
+            "%s: diarizer ran out of GPU memory at batch size %s; retrying at %d",
+            video_id,
+            batch_size or "default",
+            next_batch,
+        )
+
+    raise RuntimeError(f"diarization worker failed for {video_id}: {last_error}")
+
+
+def _batch_sizes(cfg: Config) -> list[int]:
+    """Batch sizes to try, in order. 0 means the model config's own default."""
+    first = getattr(cfg.diarize, "batch_size", 0)
+    ladder = [first]
+    size = first if first > 0 else 32
+    while size > 2:
+        size //= 2
+        ladder.append(size)
+    return ladder
+
+
+def _is_out_of_memory(stderr: str) -> bool:
+    """Whether a worker failure was memory pressure rather than a real fault.
+
+    pyannote catches the CUDA OOM itself and re-raises it as a MemoryError
+    advising a smaller batch size, so both spellings have to be recognised.
+    """
+    lowered = stderr.lower()
+    return "memoryerror" in lowered or "out of memory" in lowered or "batch_size" in lowered
 
 
 def _parse(data: dict) -> Diarization:

@@ -54,15 +54,35 @@ setup_main() {
   log "installing yt2ds and its dependencies"
   uv pip install --python "$MAIN_VENV/bin/python" -e ".[dev]"
 
+  log "installing audio-separator (vocal isolation)"
+  # --no-deps on purpose: audio-separator declares a bare `torch>=2.3`, which
+  # resolves to the latest generic build and would replace the cu128 wheel
+  # pinned above. Its own remaining requirements are listed out here; the ones
+  # already covered by yt2ds (librosa, soundfile, scipy, numpy, tqdm, pyyaml,
+  # requests, einops, julius) are omitted.
+  uv pip install --python "$MAIN_VENV/bin/python" --no-deps \
+    "audio-separator>=0.44" ml_collections absl-py \
+    "rotary-embedding-torch>=0.6.1,<0.7.0" "beartype>=0.18.5,<0.19.0" \
+    pydub onnxruntime samplerate resampy diffq
+
   "$MAIN_VENV/bin/python" - <<'PY'
 import torch, transformers
 from transformers import CohereAsrForConditionalGeneration  # noqa: F401
 import torchaudio.functional as F
 from torchaudio.pipelines import SQUIM_OBJECTIVE  # noqa: F401
+from google.cloud import speech  # default ASR backend
 assert hasattr(F, "forced_align"), "torchaudio is missing forced_align"
 print(f"  torch {torch.__version__}  cuda={torch.cuda.is_available()}")
 print(f"  transformers {transformers.__version__}")
+print(f"  google-cloud-speech {speech.__version__ if hasattr(speech, '__version__') else 'ok'}")
 PY
+  # Credentials are not installed here -- they are per-machine. The default
+  # ASR backend needs them; `--asr-backend cohere` needs none.
+  if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+    log "note: GOOGLE_APPLICATION_CREDENTIALS is unset. The default ASR backend"
+    log "      (Cloud Speech-to-Text) needs a service-account JSON; point that"
+    log "      variable at one, or run with --asr-backend cohere."
+  fi
   log "main venv ready"
 }
 
@@ -122,8 +142,8 @@ from yt2ds.models import ModelRegistry
 
 cfg = Config.load()
 reg = ModelRegistry(cfg)
-for name in ("vad", "ast", "demucs", "speaker_encoder", "asr", "aligner",
-             "squim_objective", "squim_subjective"):
+for name in ("vad", "ast", "demucs", "separator", "speaker_encoder", "asr",
+             "aligner", "squim_objective", "squim_subjective"):
     try:
         getattr(reg, name)
         print(f"  ok   {name}")

@@ -1,15 +1,16 @@
 """Per-video orchestration.
 
-Stage order is not arbitrary. Cohere Transcribe Arabic emits no timestamps, so
-the audio must be segmented *before* it is transcribed -- then each chunk's
-transcript is simply that chunk's text, with no alignment step able to go
-wrong. Forced alignment is needed only to map the YouTube subtitle text onto
-chunk boundaries.
+Stage order is not arbitrary. The audio is segmented *before* it is
+transcribed -- then each chunk's transcript is simply that chunk's text, with
+no alignment step able to go wrong. Forced alignment is needed only to map the
+YouTube subtitle text onto chunk boundaries. That order is also what lets the
+ASR backend be swapped freely: neither Cohere nor Cloud Speech-to-Text has to
+produce usable timestamps, because nothing downstream reads them.
 
 The expensive detectors run in an order chosen so each one only sees what
-survived the last: music rejection before ASR means Cohere never runs on a
-musical interlude, and speaker purity before ASR means it never runs on a chunk
-that is about to be dropped anyway.
+survived the last: music rejection before ASR means no musical interlude is
+ever transcribed, and speaker purity before ASR means neither the GPU nor the
+API bill is spent on a chunk that is about to be dropped anyway.
 
 Chunk audio is read from disk in batches rather than all at once; a two-hour
 video can produce a thousand chunks, and holding them all as float arrays would
@@ -31,7 +32,7 @@ import numpy as np
 from .config import Config
 from .io import JsonlWriter, Workspace, drop_video_records, write_json
 from .models import ModelRegistry
-from .stages import align, asr, audio, diarize, download, filters, music, quality, segment, speakers, subtitles, vad
+from .stages import align, asr, audio, diarize, download, filters, music, quality, segment, separate, speakers, subtitles, vad
 from .stages.segment import Chunk
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,16 @@ class Pipeline:
         self.cfg = cfg
         self.registry = ModelRegistry(cfg)
 
+    @property
+    def defers_asr(self) -> bool:
+        """True when transcription is a separate pass over the whole corpus.
+
+        The google_batch backend transcribes whole episodes through a
+        long-running cloud operation, so the GPU pass emits chunks with no text
+        and `yt2ds transcribe` fills them in afterwards.
+        """
+        return (self.cfg.asr.backend or "").lower() == "google_batch"
+
     # ------------------------------------------------------------------
     def run(self, urls: list[str], resume: bool = True) -> list[VideoResult]:
         video_urls = download.expand_urls(urls, self.cfg)
@@ -69,7 +80,7 @@ class Pipeline:
         results: list[VideoResult] = []
         pending: list[str] = []
         for url in video_urls:
-            video_id = download.video_id_from_url(url)
+            video_id = download.source_id(url)
             if resume and video_id and self.ws.is_complete(video_id):
                 results.append(self._already_done(video_id, url))
             else:
@@ -89,7 +100,7 @@ class Pipeline:
             if assets is None or assets.error:
                 results.append(
                     VideoResult(
-                        video_id=(assets.video_id if assets else None) or download.video_id_from_url(url) or "unknown",
+                        video_id=(assets.video_id if assets else None) or download.source_id(url) or "unknown",
                         url=url,
                         error=assets.error if assets else "download failed",
                     )
@@ -171,12 +182,17 @@ class Pipeline:
                 yield url, future.result()
 
     def _download_one(self, url: str) -> download.VideoAssets | None:
+        # A file already on disk skips the whole download stage; everything
+        # after it is identical, minus the subtitles no local file has.
+        local = download.local_source(url)
+        if local is not None:
+            return download.local_assets(local)
         try:
             assets = download.download(url, self.ws, self.cfg)
         except Exception as exc:  # noqa: BLE001
             log.error("download error for %s: %s", url, exc)
             return download.VideoAssets(
-                video_id=download.video_id_from_url(url) or "unknown",
+                video_id=download.source_id(url) or "unknown",
                 url=url,
                 error=str(exc),
             )
@@ -202,6 +218,10 @@ class Pipeline:
         started = time.time()
         prepared = audio.prepare(assets, self.ws, self.cfg)
         log.info("%s: %.1fs of audio, %.1f LUFS", assets.video_id, prepared.duration, prepared.lufs)
+
+        # Music comes out of the speech here, before anything measures or
+        # transcribes it. Everything below this line sees the isolated voice.
+        prepared = separate.apply(prepared, self.ws, self.cfg, self.registry)
 
         subs = subtitles.Subtitles()
         if assets.sub_path is not None:
@@ -234,8 +254,15 @@ class Pipeline:
             log.info("%s: aligned %d/%d subtitle words", assets.video_id, len(aligned), len(subs.words))
             align.assign_to_chunks(chunks, aligned, self.cfg)
 
-        filters.resolve_text(chunks, assets.sub_kind, self.cfg)
-        quality.apply_gates(chunks, self.cfg)
+        if self.defers_asr:
+            # No text yet, so the text gates cannot run and would reject every
+            # chunk as empty. Only the audio-side gates apply here; `yt2ds
+            # transcribe` runs the text gates once the words arrive.
+            quality.apply_gates(chunks, self.cfg)
+            self._export_for_batch(prepared, assets.video_id)
+        else:
+            filters.resolve_text(chunks, assets.sub_kind, self.cfg)
+            quality.apply_gates(chunks, self.cfg)
 
         self._emit(chunks, assets, prepared, result)
         self._finish(assets, result, prepared, started)
@@ -244,7 +271,7 @@ class Pipeline:
     # ------------------------------------------------------------------
     def _diarize(self, prepared: audio.PreparedAudio, video_id: str) -> diarize.Diarization:
         try:
-            annotation = diarize.run(prepared.work_path, self.ws, self.cfg, video_id)
+            annotation = diarize.run(prepared.work_path, self.ws, self.cfg, video_id, self.registry)
         except diarize.DiarizerUnavailable as exc:
             log.error("%s -- continuing with a single-speaker assumption", exc)
             return diarize.single_speaker(prepared.duration)
@@ -273,9 +300,10 @@ class Pipeline:
             embeddings.append(speakers.embed_batch(items, sr, self.cfg, self.registry))
 
             # Only transcribe what is still alive: no point running a 2B model
-            # over a chunk already rejected as music.
+            # -- or paying for an API call -- over a chunk already rejected as
+            # music.
             alive = [(c, a) for c, a in items if c.reject_reason is None]
-            if alive:
+            if alive and not self.defers_asr:
                 texts = asr.transcribe_batch(alive, sr, self.cfg, self.registry)
                 for (chunk, _), text in zip(alive, texts):
                     chunk.text_cohere = text
@@ -305,6 +333,25 @@ class Pipeline:
             items = [(c, audio.read_segment(prepared.master_path, sr, c.start, c.end)) for c in batch]
             quality.score_batch(items, sr, self.cfg, self.registry, reference=reference)
 
+    def _export_for_batch(self, prepared: audio.PreparedAudio, video_id: str) -> None:
+        """Stage this episode's audio for the later batch transcription pass.
+
+        The isolated voice is what gets uploaded, not the original mix: chunks
+        are cut from it, so the transcript should describe the same signal. It
+        is written now because `_cleanup` is about to delete the working copy.
+        """
+        from .stages import asr_google_batch
+
+        target = self.ws.asr_audio / f"{video_id}.flac"
+        if target.exists():
+            return
+        try:
+            asr_google_batch.export_audio(prepared.work_path, target)
+        except Exception as exc:  # noqa: BLE001 - a failed export is retryable
+            log.error("%s: could not export audio for batch ASR: %s", video_id, exc)
+            return
+        log.info("%s: staged %.0f MB for batch transcription", video_id, target.stat().st_size / 1e6)
+
     def _save_centroids(self, video_id: str, centroids: dict[str, np.ndarray]) -> None:
         """Persist per-speaker centroids for `report --link-speakers`.
 
@@ -324,8 +371,13 @@ class Pipeline:
         result: VideoResult,
     ) -> None:
         out_sr = self.cfg.audio.out_sample_rate
-        source = prepared.mp3_path if self.cfg.audio.chunk_from_mp3 and prepared.mp3_path else prepared.master_path
-        source_sr = 44100 if source is prepared.mp3_path else prepared.master_sr
+        # The MP3 is the untouched mix, so cutting from it would undo the
+        # separation. The isolated master wins whenever both are asked for.
+        from_mp3 = self.cfg.audio.chunk_from_mp3 and prepared.mp3_path is not None and not prepared.separated
+        if self.cfg.audio.chunk_from_mp3 and prepared.separated:
+            log.warning("audio.chunk_from_mp3 ignored: chunks are cut from the isolated voice, not the mix")
+        source = prepared.mp3_path if from_mp3 else prepared.master_path
+        source_sr = 44100 if from_mp3 else prepared.master_sr
 
         kept_records: list[dict[str, Any]] = []
         rejected_records: list[dict[str, Any]] = []
@@ -368,7 +420,11 @@ class Pipeline:
     ) -> dict[str, Any]:
         s = chunk.scores
         return {
-            "audio_file": f"{assets.video_id}_{chunk.index:04d}.wav",
+            # One directory per speaker. The label is already namespaced by
+            # video, so a multi-speaker recording lands as one folder per voice
+            # in it; `report --link-speakers` then regroups those folders into
+            # one per global identity.
+            "audio_file": f"{chunk.speaker}/{assets.video_id}_{chunk.index:04d}.wav",
             "video_id": assets.video_id,
             "video_url": assets.url,
             "title": assets.title,
@@ -382,7 +438,10 @@ class Pipeline:
             "global_speaker": None,
             "speaker_conf": s.get("speaker_conf"),
             "text": chunk.text,
-            "text_source": chunk.text_source,
+            # "pending" marks a row the GPU pass emitted without text, for
+            # `yt2ds transcribe` to fill in. It is not a text_source anyone
+            # reads as provenance -- that is overwritten when the words land.
+            "text_source": "pending" if self.defers_asr else chunk.text_source,
             "text_yt": chunk.text_yt,
             "text_cohere": chunk.text_cohere,
             "cer_yt_vs_cohere": s.get("cer_yt_vs_cohere"),
@@ -392,6 +451,9 @@ class Pipeline:
             "align_score": s.get("align_score"),
             "aligned_words": s.get("aligned_words"),
             "boundary_clipped": s.get("boundary_clipped"),
+            # Music scores are measured *after* separation, so they describe
+            # what the isolator left behind rather than what was in the mix.
+            "vocals_isolated": prepared.separated,
             "music_score": s.get("music_score"),
             "music_label": s.get("music_label"),
             "speech_score": s.get("speech_score"),
@@ -463,14 +525,20 @@ class Pipeline:
         What survives is the deliverable plus the speaker centroids and the
         state file, so `report --link-speakers` and resume still work on a
         dataset built over many runs.
+
+        A local source file is never touched: it is the user's own corpus, not
+        something this run fetched and can fetch again.
         """
         if self.cfg.runtime.keep_intermediates:
             return
 
         spent: list[Path | None] = [
-            assets.audio_path,
+            None if assets.is_local else assets.audio_path,
             prepared.master_path,
             prepared.work_path,
+            # Present only when the pre-separation decode was kept.
+            prepared.source_master_path,
+            prepared.source_work_path,
             assets.sub_path,
             self.ws.raw / f"{assets.video_id}.info.json",
         ]

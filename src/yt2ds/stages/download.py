@@ -47,6 +47,9 @@ class VideoAssets:
     sub_kind: str | None = None
     info: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # A file that was already on disk rather than something we fetched. The
+    # pipeline must never delete it during cleanup.
+    is_local: bool = False
 
 
 def _match_lang(available: list[str], patterns: list[str]) -> str | None:
@@ -92,6 +95,16 @@ def video_id_from_url(url: str) -> str | None:
     return None
 
 
+def source_id(spec: str) -> str | None:
+    """Id for a source that may be a URL or a local path.
+
+    The resume check runs before anything is fetched, so it needs an id for
+    both kinds of input.
+    """
+    path = local_source(spec)
+    return local_id(path) if path is not None else video_id_from_url(spec)
+
+
 def probe(url: str, cfg: Config) -> dict[str, Any] | None:
     """Fetch metadata for a single video without downloading media."""
     info, error = _extract(url, cfg, {"skip_download": True}, download=False)
@@ -111,8 +124,32 @@ def expand_urls(urls: list[str], cfg: Config, max_depth: int = 2) -> list[str]:
     A listing can contain listings -- a channel's `/playlists` tab is a page of
     playlist links, not videos -- so anything that comes back still pointing at
     a container is queued and expanded in turn, up to ``max_depth``.
+
+    Local paths are the other kind of container: a directory expands to the
+    audio files inside it, a file stands for itself, and neither touches the
+    network.
     """
     from collections import deque
+
+    expanded: list[str] = []
+    seen: set[str] = set()
+    remote: list[str] = []
+
+    for spec in urls:
+        path = local_source(spec)
+        if path is None:
+            remote.append(spec)
+            continue
+        files = expand_local(path)
+        if not files:
+            log.error("no audio files found in %s", path)
+        for file in files:
+            item = str(file)
+            if item not in seen:
+                seen.add(item)
+                expanded.append(item)
+        if path.is_dir():
+            log.info("%s -> %d local file(s)", path, len(files))
 
     extra = {
         "extract_flat": "in_playlist",
@@ -124,10 +161,8 @@ def expand_urls(urls: list[str], cfg: Config, max_depth: int = 2) -> list[str]:
         "noplaylist": not cfg.download.follow_playlist,
     }
 
-    expanded: list[str] = []
-    seen: set[str] = set()
-    queue: deque[tuple[str, int]] = deque((url, 0) for url in urls)
-    visited: set[str] = set(urls)
+    queue: deque[tuple[str, int]] = deque((url, 0) for url in remote)
+    visited: set[str] = set(remote)
 
     while queue:
         url, depth = queue.popleft()
@@ -440,6 +475,66 @@ def _find_audio(directory: Path, video_id: str) -> Path | None:
         if p.is_file() and p.suffix.lower() in _AUDIO_SUFFIXES
     ]
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+
+def local_source(spec: str) -> Path | None:
+    """Return the path if ``spec`` names an existing local file or directory.
+
+    This is what lets a corpus already on disk be fed to the same pipeline as
+    a YouTube link. Anything carrying a scheme other than ``file://`` is a URL
+    and is left to yt-dlp, so a link is never mistaken for a path.
+    """
+    if spec.startswith("file://"):
+        from urllib.parse import urlparse
+        from urllib.request import url2pathname
+
+        spec = url2pathname(urlparse(spec).path)
+    elif "://" in spec:
+        return None
+
+    path = Path(spec).expanduser()
+    return path if path.exists() else None
+
+
+def _natural_key(path: Path) -> list[Any]:
+    """Sort ``2.mp3`` before ``10.mp3``, which plain lexical order does not."""
+    import re
+
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
+
+
+def expand_local(path: Path) -> list[Path]:
+    """A directory expands to the audio files in it; a file is itself."""
+    if not path.is_dir():
+        return [path.resolve()]
+    files = [p for p in path.iterdir() if p.is_file() and p.suffix.lower() in _AUDIO_SUFFIXES]
+    return [p.resolve() for p in sorted(files, key=_natural_key)]
+
+
+def local_id(path: Path) -> str:
+    """Dataset id for a local file: its stem, reduced to id-safe characters."""
+    import re
+
+    stem = re.sub(r"[^0-9A-Za-z_-]+", "_", path.stem).strip("_")
+    return stem or "local"
+
+
+def local_assets(path: Path) -> VideoAssets:
+    """Build the assets for a file already on disk -- no network, no subtitles.
+
+    ``url`` is the path itself so the record in ``metadata.jsonl`` says where
+    the audio came from, and so a line in ``failed.txt`` can be fed straight
+    back in on a retry.
+    """
+    path = path.resolve()
+    return VideoAssets(
+        video_id=local_id(path),
+        url=str(path),
+        title=path.stem,
+        audio_path=path,
+        info={"id": local_id(path), "title": path.stem, "source": "local"},
+        is_local=True,
+    )
 
 
 def _find_subtitle(directory: Path, video_id: str, lang: str) -> Path | None:

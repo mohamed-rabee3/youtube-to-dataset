@@ -25,6 +25,9 @@ venv/
 *.pth
 *.onnx
 
+# Source corpora fed to the pipeline as local files.
+socrates/
+
 # Datasets and pipeline output. These are large and reproducible.
 dataset/
 datasets/
@@ -39,3 +42,11 @@ mp3/
 .idea/
 .DS_Store
 videos
+
+logs/
+dataset-nafas-trial/
+
+dataset-nafas/
+nafas/
+
+socrates/

@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from yt2ds.arabic import arabic_ratio, cer, clean_for_output, normalize, wer
+from yt2ds.arabic import (
+    arabic_ratio,
+    cer,
+    clean_for_output,
+    normalize,
+    same_skeleton,
+    strip_final_tashkeel,
+    strip_tashkeel,
+    tashkeel_ratio,
+    wer,
+)
 
 
 class TestNormalize:
@@ -97,3 +107,95 @@ class TestArabicRatio:
     def test_empty_and_punctuation_only(self):
         assert arabic_ratio("") == 0.0
         assert arabic_ratio("...!؟") == 0.0
+
+
+class TestTashkeel:
+    """Diacritics for TTS: no case endings, and the letters never move."""
+
+    def test_strip_tashkeel_leaves_the_skeleton(self):
+        assert strip_tashkeel("مَرْحَبًا") == "مرحبا"
+
+    def test_ratio_counts_marks_per_letter(self):
+        assert tashkeel_ratio("مرحبا") == 0.0
+        assert tashkeel_ratio("مَرْح") > 0.0
+
+    def test_final_haraka_is_removed(self):
+        # bi-kum + sukun on the final meem
+        assert strip_final_tashkeel("بِكُمْ") == "بِكُم"
+
+    def test_final_tanwin_is_removed(self):
+        # kitaab + dammatan
+        assert strip_final_tashkeel("كِتَابٌ") == "كِتَاب"
+
+    def test_tanwin_fath_before_a_silent_alef_is_removed(self):
+        # marhaban: the tanwin sits on the BAA, not on the final alef, so
+        # clearing only the last letter would leave the case ending in place.
+        assert strip_final_tashkeel(
+            "مَرْحَبًا"
+        ) == "مَرْحَبا"
+
+    def test_an_ordinary_fatha_before_a_final_alef_survives(self):
+        # qaalaa: that fatha is part of the word, not an ending.
+        word = "قَالَا"
+        assert strip_final_tashkeel(word) == word
+
+    def test_internal_shadda_survives(self):
+        # ummu-ki: shadda stays, the final kasra goes.
+        assert strip_final_tashkeel(
+            "أُمُّكِ"
+        ) == "أُمُّك"
+
+    def test_punctuation_is_not_absorbed_into_the_word(self):
+        # Regression: a bidi-mangled character class once swallowed the Arabic
+        # question mark into the word, leaving its final letter marked.
+        assert strip_final_tashkeel(
+            "الحَالُ؟"
+        ) == "الحَال؟"
+
+    def test_latin_and_spacing_pass_through(self):
+        text = "قال hello يا صَاح"
+        assert strip_final_tashkeel(text) == text
+
+    def test_stripping_never_changes_the_letters(self):
+        for word in (
+            "بِكُمْ",
+            "كِتَابٌ",
+            "مَرْحَبًا",
+            "فَتَاةً",
+        ):
+            assert same_skeleton(word, strip_final_tashkeel(word))
+
+    def test_same_skeleton_detects_a_rewritten_word(self):
+        assert same_skeleton("مَرحبا", "مرحبا")
+        assert not same_skeleton("مرحبا", "مرحبا بكم")
+
+
+class TestTatweelIsNotOutput:
+    """Tatweel is typography, not orthography: it must never reach the dataset.
+
+    A diacritizer asked to add marks will occasionally insert one as somewhere
+    to hang a vowel, which would put a silent character into a TTS target.
+    """
+
+    def test_tatweel_is_stripped_from_output(self):
+        from yt2ds.arabic import clean_for_output
+
+        assert clean_for_output("أَنْقُـل") == "أَنْقُل"
+        assert clean_for_output("علـى طاولـه") == "على طاوله"
+
+    def test_stripping_tatweel_keeps_every_mark_and_letter(self):
+        from yt2ds.arabic import clean_for_output, same_skeleton, tashkeel_ratio
+
+        marked = "أَنْقُـل أَسْئِلَتِكُـم"
+        out = clean_for_output(marked)
+        assert "ـ" not in out
+        assert same_skeleton(out, "أنقل أسئلتكم")
+        assert tashkeel_ratio(out) > 0
+
+    def test_a_trailing_tatweel_cannot_shield_a_case_ending(self):
+        # Tatweel sits inside the Arabic letter range, so left in place it
+        # would pose as the final letter and keep strip_final_tashkeel from
+        # reaching the real one.
+        from yt2ds.arabic import clean_for_output, strip_final_tashkeel
+
+        assert strip_final_tashkeel(clean_for_output("الْمَرْكَزُـ")) == "الْمَرْكَز"
