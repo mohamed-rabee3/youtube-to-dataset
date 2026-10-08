@@ -22,9 +22,13 @@ then enforced in code rather than trusted to the model
 * no mark on any word's final letter, because Arabic case endings are
   grammatical and inaudible in ordinary speech.
 
+For datasets the pipeline builds today this pass is unnecessary: the default
+ASR model (Cohere-Speech-Tashkeel-2B) already writes diacritized text. It is
+for older datasets and for text that came from elsewhere.
+
 Output, per the dataset schema: ``text`` becomes the diacritized string and
-``text_cohere`` keeps the undiacritized transcript it was built from, so
-nothing is lost and ``to_voxcpm.py`` picks up the marks with no change.
+``text_asr`` keeps the undiacritized transcript it was built from, so nothing
+is lost and ``to_voxcpm.py`` picks up the marks with no change.
 
 Results are cached in ``.work/diacritize_cache.jsonl`` as they arrive, so an
 interrupted run resumes without re-paying for a clip.
@@ -55,7 +59,6 @@ from yt2ds.arabic import (  # noqa: E402
     same_skeleton,
     same_words,
     strip_final_tashkeel,
-    strip_tashkeel,
     tashkeel_ratio,
 )
 
@@ -156,9 +159,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="gemini-3.7-flash")
     parser.add_argument(
         "--source",
-        choices=["auto", "text", "text_cohere"],
+        choices=["auto", "text", "text_asr"],
         default="auto",
-        help="which transcript to diacritize. auto = text_cohere when present "
+        help="which transcript to diacritize. auto = text_asr when present "
         "(best orthography; YouTube captions drop ta marbuta and hamza), else text",
     )
     parser.add_argument(
@@ -198,9 +201,13 @@ def _source_field(row: dict, mode: str) -> str:
     """Which column the text to diacritize comes from."""
     if mode != "auto":
         return mode
-    # text_cohere first: YouTube's Arabic captions drop ta marbuta and hamza
-    # seats, so diacritizing them would build marks on damaged spelling.
-    return "text_cohere" if (row.get("text_cohere") or "").strip() else "text"
+    # The ASR transcript first: YouTube's Arabic captions drop ta marbuta and
+    # hamza seats, so diacritizing them would build marks on damaged spelling.
+    # Datasets from before the column rename call it text_cohere.
+    for field in ("text_asr", "text_cohere"):
+        if (row.get(field) or "").strip():
+            return field
+    return "text"
 
 
 def _source_text(row: dict, mode: str) -> str:
@@ -387,16 +394,16 @@ def _write(dataset: Path, rows: list[dict], cache: dict, args) -> None:
         else:
             statuses[entry["status"]] = statuses.get(entry["status"], 0) + 1
             if entry["status"] in OK_STATUSES and entry["text"]:
-                # text carries the marks; text_cohere keeps the plain
+                # text carries the marks; text_asr keeps the plain
                 # transcript they were derived from.
                 new["text"] = entry["text"]
-                new["text_cohere"] = entry["source"]
+                new["text_asr"] = entry["source"]
                 new["tashkeel_ratio"] = round(tashkeel_ratio(entry["text"]), 4)
                 new["tashkeel_source"] = entry.get("source_field", args.source)
                 # On a subtitle-sourced row, `text` was YouTube's caption and
                 # is now a diacritized Cohere transcript. text_source names
                 # where the canonical text came from, so it has to follow.
-                if new["tashkeel_source"] == "text_cohere" and not str(new.get("text_source", "")).startswith("cohere"):
+                if new["tashkeel_source"] in ("text_asr", "text_cohere") and not str(new.get("text_source", "")).startswith("cohere"):
                     new["text_source"] = "cohere+tashkeel"
                 elif not str(new.get("text_source", "")).endswith("+tashkeel"):
                     new["text_source"] = f"{new.get('text_source', 'asr')}+tashkeel"

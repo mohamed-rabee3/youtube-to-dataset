@@ -17,9 +17,7 @@ def cfg():
 def chunk(yt="", asr="", start=0.0, end=5.0, **scores):
     c = Chunk(index=0, start=start, end=end, speaker="A")
     c.text_yt = yt
-    # The column is named text_cohere for schema continuity with datasets built
-    # before the Google backend; it holds whichever backend transcribed it.
-    c.text_cohere = asr
+    c.text_asr = asr
     c.scores.update(scores)
     return c
 
@@ -39,27 +37,33 @@ def arabic_at(cps: float, duration: float, word_len: int = 4) -> str:
 
 
 class TestTextSource:
-    def test_youtube_text_wins_when_both_agree(self, cfg):
-        # Same sentence, different orthography: the dataset keeps YouTube's
-        # spelling rather than the ASR's.
+    def test_asr_text_is_kept_when_subtitles_agree(self, cfg):
+        # The subtitles verify; the diacritized ASR text is what is kept.
+        c = chunk("اهلا وسهلا بكم جميعا", "أَهْلًا وَسَهْلًا بِكُمْ جَمِيعًا", end=2.5)
+        resolve_text([c], "yt_auto", cfg)
+        assert c.text == "أَهْلًا وَسَهْلًا بِكُمْ جَمِيعًا"
+        assert c.text_source == "cohere+yt_auto"
+        assert c.reject_reason is None
+
+    def test_youtube_text_kept_when_asr_text_is_not_preferred(self, cfg):
+        cfg.filters.prefer_asr_text = False
         c = chunk("أهلاً وسهلاً بكم جميعاً", "اهلا وسهلا بكم جميعا")
         resolve_text([c], "yt_auto", cfg)
         assert c.text == "أهلاً وسهلاً بكم جميعاً"
         assert c.text_source == "yt_auto"
-        assert c.reject_reason is None
 
     def test_asr_is_canonical_when_there_are_no_subtitles(self, cfg):
         c = chunk("", "مرحبا بكم في هذا المقطع", start=0.0, end=3.0)
         resolve_text([c], None, cfg)
-        assert c.text_source == "google"
+        assert c.text_source == "cohere"
         assert c.text == "مرحبا بكم في هذا المقطع"
         assert c.reject_reason is None
 
     def test_text_source_names_the_backend_that_produced_it(self, cfg):
-        cfg.asr.backend = "cohere"
+        cfg.asr.backend = "google"
         c = chunk("", "مرحبا بكم في هذا المقطع", start=0.0, end=3.0)
         resolve_text([c], None, cfg)
-        assert c.text_source == "cohere"
+        assert c.text_source == "google"
 
     def test_cer_gate_drops_disagreement(self, cfg):
         c = chunk("مرحبا بكم في هذا المقطع", "الرياض مدينة كبيرة جدا اليوم")
@@ -70,7 +74,7 @@ class TestTextSource:
     def test_cer_gate_does_not_apply_to_the_asr_only_path(self, cfg):
         c = chunk("", "مرحبا بكم في هذا المقطع", start=0.0, end=3.0)
         resolve_text([c], None, cfg)
-        assert c.scores["cer_yt_vs_cohere"] is None
+        assert c.scores["cer_yt_vs_asr"] is None
         assert c.reject_reason is None
 
     def test_silent_asr_against_confident_subtitles_is_rejected(self, cfg):
@@ -88,8 +92,8 @@ class TestTextSource:
     def test_both_texts_are_preserved_for_retuning(self, cfg):
         c = chunk("مرحبا بكم في هذا", "مرحبا بكم في ذاك")
         resolve_text([c], "yt_auto", cfg)
-        assert c.text_yt and c.text_cohere
-        assert c.scores["cer_yt_vs_cohere"] is not None
+        assert c.text_yt and c.text_asr
+        assert c.scores["cer_yt_vs_asr"] is not None
 
 
 class TestCharsPerSecond:
@@ -145,7 +149,7 @@ class TestOtherTextGates:
         c = chunk("", "hello everyone and welcome back", start=0.0, end=3.0, asr_language="en")
         resolve_text([c], None, cfg)
         assert c.reject_reason is None
-        assert c.text_source == "google"
+        assert c.text_source == "cohere"
         assert c.scores["script_ratio"] == pytest.approx(1.0)
 
     def test_code_switched_arabic_with_english_words_passes(self, cfg):
@@ -163,7 +167,8 @@ class TestOtherTextGates:
 
     def test_google_confidence_is_gated_on_its_own_0_to_1_scale(self, cfg):
         # Google reports 0-1, Cohere a log-probability. A 0.2 that would sail
-        # past the log-prob floor of -1.0 must still be rejected.
+        # past the log-prob floor must still be rejected.
+        cfg.asr.backend = "google"
         text = arabic_at(9.5, 5.0)
         low = chunk("", text, start=0.0, end=5.0, asr_language="ar", asr_confidence=0.2)
         resolve_text([low], None, cfg)
@@ -242,7 +247,7 @@ class TestDiacritizedTextIsMeasuredOnItsSkeleton:
         return {
             "audio_file": "SPK0/v_0000.wav", "video_id": "v", "chunk_index": 0,
             "start": 0.0, "end": duration, "duration": duration,
-            "text_cohere": text, "text_source": "google_batch",
+            "text": text, "text_source": "google_batch",
         }
 
     def test_marked_and_unmarked_text_score_the_same(self):
@@ -261,3 +266,70 @@ class TestDiacritizedTextIsMeasuredOnItsSkeleton:
         marked = "ضَيْفْنَا هَالْحَلَقَة سَعَادَة الأُسْتَاذ إِبْرَاهِيم نِيَاز"
         kept, rejected = filters.gate_rows([self._row(marked, 4.5)], self._cfg())
         assert kept and not rejected, f"unexpectedly rejected: {rejected}"
+
+
+class TestVerifyGate:
+    """The canonical ASR text against the verify model's transcript."""
+
+    def test_agreeing_transcripts_pass_and_record_the_cer(self, cfg):
+        c = chunk("", "مَرْحَبًا بِكُمْ فِي هَذَا الْمَقْطَعِ", start=0.0, end=3.0)
+        c.text_verify = "مرحبا بكم في هذا المقطع"
+        resolve_text([c], None, cfg)
+        assert c.reject_reason is None
+        assert c.scores["cer_verify"] == pytest.approx(0.0)
+
+    def test_disagreeing_transcripts_are_rejected(self, cfg):
+        c = chunk("", "مرحبا بكم في هذا المقطع الجديد", start=0.0, end=3.0)
+        c.text_verify = "الرياض مدينة كبيرة جدا اليوم"
+        resolve_text([c], None, cfg)
+        assert c.reject_reason is not None
+        assert c.reject_reason.startswith("text:verify_cer")
+
+    def test_english_or_digits_in_either_transcript_skip_the_check(self, cfg):
+        # One model writes "social anxiety", the other "سوشيل أنزايتي": the
+        # pair cannot be compared fairly, so it is not gated.
+        c = chunk("", "القلق الاجتماعي أو سوشيل أنزايتي", start=0.0, end=3.0)
+        c.text_verify = "القلق الاجتماعي social anxiety"
+        resolve_text([c], None, cfg)
+        assert c.reject_reason is None
+        assert c.scores["cer_verify"] is None
+
+    def test_no_verify_transcript_means_no_check(self, cfg):
+        c = chunk("", "مرحبا بكم في هذا المقطع", start=0.0, end=3.0)
+        resolve_text([c], None, cfg)
+        assert c.scores["cer_verify"] is None
+
+
+class TestSpeechRateUsesTheSpeechNotThePadding:
+    def test_padding_does_not_dilute_the_rate(self, cfg):
+        # 3 s of speech inside a clip padded to 5 s: the rate is per second
+        # of speech.
+        text = arabic_at(10.0, 3.0)
+        c = chunk("", text, start=0.0, end=5.0)
+        c.speech_start, c.speech_end = 1.0, 4.0
+        resolve_text([c], None, cfg)
+        assert c.scores["chars_per_sec"] == pytest.approx(10.0, abs=0.5)
+
+
+class TestRowGatesUseTheRightConfidenceScale:
+    def _row(self, source, confidence):
+        return {
+            "audio_file": "v_0000.wav", "video_id": "v", "chunk_index": 0,
+            "start": 0.0, "end": 4.0, "duration": 4.0,
+            "text": "مرحبا بكم في هذا المقطع الجديد اليوم", "text_source": source,
+            "asr_confidence": confidence,
+        }
+
+    def test_a_confident_cohere_row_is_not_judged_on_googles_scale(self, cfg):
+        # -0.03 is a confident Cohere transcript; on Google's 0-1 scale it
+        # would read as hopeless. The row must be kept.
+        from yt2ds.stages import filters
+
+        kept, rejected = filters.gate_rows([self._row("cohere", -0.03)], cfg)
+        assert kept and not rejected
+
+    def test_gemini_rows_have_no_confidence_to_gate(self, cfg):
+        from yt2ds.stages import filters
+
+        kept, _ = filters.gate_rows([self._row("gemini", None)], cfg)
+        assert kept

@@ -7,7 +7,8 @@ torchaudio, so this costs no extra model downloads.
 
 SQUIM_SUBJECTIVE needs a *non-matching reference* -- any clean speech clip,
 unrelated to the input. Rather than bundling an audio asset, the pipeline picks
-the highest-STOI chunk of the same video as the reference. That is
+the highest-STOI chunk of the whole video as the reference, once every chunk
+has been scored. That is
 self-contained, and it means the MOS is effectively "how does this clip compare
 to the cleanest thing this speaker recorded", which is the comparison worth
 making when deciding what to keep for voice cloning.
@@ -42,17 +43,23 @@ def score_batch(
     sr: int,
     cfg: Config,
     registry: ModelRegistry,
-    reference: np.ndarray | None = None,
 ) -> None:
-    """Write quality metrics into ``chunk.scores`` for a batch."""
+    """Write signal statistics and SQUIM objective metrics into ``chunk.scores``."""
     if not items:
         return
-
     for chunk, samples in items:
         _signal_stats(chunk, samples)
-
     _squim_objective(items, sr, registry)
-    if reference is not None and reference.size:
+
+
+def score_mos(
+    items: list[tuple[Chunk, np.ndarray]],
+    sr: int,
+    registry: ModelRegistry,
+    reference: np.ndarray | None,
+) -> None:
+    """Write SQUIM MOS into ``chunk.scores``, judged against ``reference``."""
+    if items and reference is not None and reference.size:
         _squim_subjective(items, sr, registry, reference)
 
 
@@ -99,18 +106,11 @@ def apply_gates(chunks: list[Chunk], cfg: Config) -> None:
             continue
 
 
-def pick_reference(items: list[tuple[Chunk, np.ndarray]], sr: int) -> np.ndarray | None:
-    """Choose the cleanest chunk in a batch to serve as the SQUIM reference."""
-    best: np.ndarray | None = None
-    best_stoi = -1.0
-    for chunk, samples in items:
-        stoi = chunk.scores.get("squim_stoi")
-        if stoi is not None and stoi > best_stoi and samples.size:
-            best_stoi = stoi
-            best = samples
-    if best is None:
+def prepare_reference(samples: np.ndarray, sr: int) -> np.ndarray | None:
+    """Resample and trim a clip for use as the SQUIM MOS reference."""
+    if samples.size == 0:
         return None
-    audio = resample(best, sr, _SQUIM_SR)
+    audio = resample(samples, sr, _SQUIM_SR)
     return audio[: int(_MAX_SECONDS * _SQUIM_SR)]
 
 

@@ -57,6 +57,7 @@ from transcribe_gemini import (  # noqa: E402
     _load_cache,
     _write,
     build_prompt,
+    group_requests,
 )
 
 from yt2ds.config import Config  # noqa: E402
@@ -147,8 +148,7 @@ def phase_submit(
     """Shard the outstanding clips into batch jobs and submit them."""
     prompt = build_prompt(args.dialect)
     requests_ = []
-    for start in range(0, len(rows), args.clips_per_request):
-        batch = rows[start : start + args.clips_per_request]
+    for batch in group_requests(rows, args.clips_per_request):
         parts = [
             {
                 "fileData": {
@@ -301,7 +301,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--prefix", default="vertex-asr", help="object prefix inside the bucket")
     p.add_argument("--model", default="gemini-3.7-flash")
     p.add_argument("--dialect", help="najdi | hijazi | gulf | saudi | egyptian | levantine")
-    p.add_argument("--clips-per-request", type=int, default=4)
+    p.add_argument(
+        "--clips-per-request",
+        type=int,
+        default=1,
+        help="clips per request (default 1). Above 1, clips of one video never share a request; "
+        "see transcribe_gemini.group_requests for why",
+    )
     p.add_argument("--requests-per-job", type=int, default=5000)
     p.add_argument("--upload-workers", type=int, default=32)
     p.add_argument("--poll-interval", type=float, default=60.0)
@@ -334,7 +340,6 @@ def main(argv: list[str] | None = None) -> int:
 
     import google.auth
     import google.auth.transport.requests
-    import requests as requests_lib
     from google.cloud import storage
 
     credentials, default_project = google.auth.default(

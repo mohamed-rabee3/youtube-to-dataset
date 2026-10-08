@@ -21,8 +21,10 @@ def cfg():
 
 
 class TestDispatch:
-    def test_google_is_the_default_backend(self, cfg):
-        assert cfg.asr.backend == "google"
+    def test_cohere_tashkeel_is_the_default_backend(self, cfg):
+        assert cfg.asr.backend == "cohere"
+        assert cfg.asr.model == "NAMAA-Space/Cohere-Speech-Tashkeel-2B"
+        assert cfg.asr.languages == ["ar"]
 
     def test_unknown_backend_is_rejected(self, cfg):
         cfg.asr.backend = "whisper"
@@ -37,6 +39,7 @@ class TestDispatch:
 
 class TestLocales:
     def test_short_codes_become_bcp47(self, cfg):
+        cfg.asr.languages = ["ar", "en"]
         assert asr_google._locales(cfg) == ["ar-SA", "en-US"]
 
     def test_a_locale_passes_through_unchanged(self, cfg):
@@ -136,6 +139,8 @@ def fast_cfg():
     """Config with the retry sleep taken out, and no leaked fallback state."""
     asr_google._alternatives_rejected = False
     cfg = Config.load()
+    cfg.asr.backend = "google"
+    cfg.asr.languages = ["ar", "en"]
     cfg.asr.google.retry_backoff = 0.0
     yield cfg
     asr_google._alternatives_rejected = False

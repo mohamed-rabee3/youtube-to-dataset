@@ -249,7 +249,8 @@ def assign_to_rows(rows: list[dict], words: list[BatchWord]) -> int:
     filled = 0
     for i, row in enumerate(ordered):
         collected = buckets.get(i, [])
-        row["text_cohere"] = " ".join(w.text for w in collected)
+        row["text_asr"] = " ".join(w.text for w in collected)
+        row["text"] = row["text_asr"]
         # Every row of a transcribed episode leaves "pending", including one no
         # word covered. Otherwise a silent chunk is indistinguishable from an
         # episode that was never sent, and would wait forever instead of being

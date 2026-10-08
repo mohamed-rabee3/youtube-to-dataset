@@ -1,7 +1,8 @@
 # youtube-to-dataset
 
-Turn YouTube links into an Arabic **TTS / voice-cloning dataset**: a `wavs/`
-folder of clean, single-speaker clips and a `metadata.jsonl` with verified
+Turn YouTube links or local audio into an Arabic **TTS / voice-cloning
+dataset**: a `wavs/` folder of clean, single-speaker clips that start and end in
+real pauses, and a `metadata.jsonl` with fully diacritized, cross-checked
 transcripts. Built for dialectal Arabic — Saudi, Egyptian, and everything else
 — not just Modern Standard.
 
@@ -10,14 +11,16 @@ yt2ds run "https://youtu.be/VIDEO_ID" --out dataset/
 yt2ds run URL1 URL2 URL3 --out dataset/
 yt2ds run --urls-file links.txt --out dataset/ --workers 4
 yt2ds run mp3-corpus/ --out dataset/             # audio already on disk
-yt2ds run URL --out dataset/ --languages ar      # Arabic only
-yt2ds run URL --out dataset/ --asr-backend cohere  # transcribe locally, no API
-yt2ds report dataset/ --link-speakers
+yt2ds run URL --out dataset/ --asr-backend google  # Cloud Speech-to-Text instead
+yt2ds speakers dataset/                            # one folder per voice
+yt2ds report dataset/
 ```
 
-Transcription defaults to **Google Cloud Speech-to-Text** (`latest_long`), so
-it needs credentials — see [Transcription backends](#transcription-backends).
-`--asr-backend cohere` runs the local GPU model instead and needs none.
+Transcription runs locally on the GPU by default:
+**[Cohere-Speech-Tashkeel-2B](https://huggingface.co/NAMAA-Space/Cohere-Speech-Tashkeel-2B)**
+writes fully diacritized Arabic straight from the audio, and
+**Cohere Transcribe Arabic** transcribes every clip a second time as a check.
+No API key, no per-minute cost — see [Transcription backends](#transcription-backends).
 
 Playlist and channel URLs are expanded automatically, so a whole podcast series
 is one argument:
@@ -134,12 +137,14 @@ parallel downloads from one IP is what triggers throttling in the first place.
 ## What it does
 
 ```
-download ──> decode ──> isolate voice ──────> diarize ──> VAD ──> segment ──>
-             (48k+16k)  (Mel-Band RoFormer)   (DiariZen)          (chunks)
+download ──> decode ──> isolate voice ──────> diarize ──> VAD ──> segment ──────>
+             (48k+16k)  (Mel-Band RoFormer)   (DiariZen)  (Silero) (edges in pauses)
 
-  ──> music/noise ──> speaker purity ──> transcribe ──> align YT subs ──> emit
-      (Demucs + AST)  (ECAPA)            (Google STT)   (MMS CTC)
-                                         (or Cohere)
+  ──> music/noise ──> speaker purity ──> transcribe ─────────> verify ─────> emit
+      (Demucs + AST)  (ResNet293)        (Tashkeel-2B,         (Cohere        (loudness,
+                                          diacritized)          Transcribe)    no clipping)
+
+  then:  yt2ds speakers  ──>  speakers/GLOBAL_SPEAKER_nn/   (one folder per voice)
 ```
 
 Each chunk that survives becomes a `wavs/<speaker>/*.wav` at 24 kHz mono plus
@@ -148,14 +153,51 @@ reason and every score, so nothing is silently thrown away.
 
 ### The design decision that matters
 
-**Segment first, transcribe second.** A chunk's transcript is then simply that
-chunk's text — there is no alignment step that can drift, and no word can bleed
-across a boundary. It also means no transcriber has to produce usable
-timestamps, which is what lets the backend be swapped: Cohere Transcribe Arabic
-emits none at all, and nothing downstream misses them.
+**Segment first, transcribe second — one clip at a time.** A chunk's transcript
+is then simply that chunk's text: there is no alignment step that can drift, and
+no transcriber is ever shown two clips at once, so no clip's words can end up in
+its neighbour's label. (An audit of a corpus transcribed four neighbouring clips
+per request found ~13% of labels shifted onto the wrong clip; see
+[Text fidelity](#text-fidelity).)
 
 Forced alignment is used only for the other path: mapping YouTube's subtitle
 *text* onto chunk boundaries so the two transcripts can be compared.
+
+### Clip boundaries
+
+The rule the segmenter enforces: **every clip starts and ends in a real
+pause.** A clip cut mid-word teaches a TTS model to clip its own words, and a
+clip whose edge holds a sliver of the next sentence teaches it to babble one.
+
+* A clip edge must sit at a VAD region boundary with at least
+  `segment.min_cut_pause` (0.15 s) of silence to the nearest speech of *any*
+  speaker — VAD's, or a diarized turn VAD missed.
+* An edge that lands mid-phrase — a speaker change or overlapped speech with no
+  pause — is pulled back to the previous valid pause. The partial phrase is
+  dropped, never cut.
+* Long speech is split only at its longest valid pause (sentence ends pause
+  longest). A stretch with no valid pause is dropped; there is no fixed-length
+  fallback cut.
+* Each clip gets up to `segment.pad` (0.25 s) of silence on each side, but
+  never more than half the gap to the neighbouring speech — so no two clips
+  share audio, and no clip's padding contains someone's words.
+* Same-speaker speech separated by up to `segment.merge_gap` (0.8 s) stays in
+  one clip, so sentences are not chopped at every breath.
+
+Each row records where its speech sits (`speech_start`, `speech_end`,
+`voiced_seconds`, `max_internal_pause`), so the padding is visible.
+
+These rules replace an earlier design that padded every chunk blindly by 0.2 s
+and fell back to a fixed time grid when a stretch had no pause. An audit of a
+14-hour dataset built that way found 17% of clips overlapping their
+neighbour by up to 0.4 s, and 758 clips cut on the grid mid-word.
+`tests/test_segment.py` checks the guarantees above on 200 randomly generated
+conversations.
+
+Written clips are loudness-normalized (`audio.loudness: clip`, −23 LUFS by
+default, or one gain per video with `video`), with the gain capped so no sample
+exceeds `audio.peak_ceiling_dbfs` (−1 dBFS) *after* resampling — nothing is ever
+hard-clipped by the 16-bit writer — and a 10 ms fade on each edge.
 
 ### Music: removed, not avoided
 
@@ -192,39 +234,50 @@ filename, so a different isolator is a config change.
 
 ### Text fidelity
 
-YouTube's auto-captions for heavy Saudi or Egyptian dialect are frequently
-wrong. For an ASR dataset that is tolerable noise; for TTS it is not — a wrong
-transcript teaches the model to pronounce a word as something else.
+For TTS a wrong transcript is not noise — it teaches the model to say a word as
+something else. So no transcript is trusted on its own:
 
-So every chunk gets **two** transcripts: YouTube's (force-aligned onto the
-chunk) and the ASR backend's. YouTube's text is canonical, but the chunk is
-dropped when the character error rate between them exceeds
-`filters.max_cer_yt_vs_cohere` (default 0.35). Both texts stay in the metadata,
-so the threshold can be re-tuned against `rejected.jsonl` without recomputing
-anything.
+* **Two independent transcriptions of every clip.** The canonical text comes
+  from `asr.model` (Cohere-Speech-Tashkeel-2B); `asr.verify_model` (Cohere
+  Transcribe Arabic) transcribes the same clip again. A clip is dropped when the
+  undiacritized skeletons disagree by more than `filters.max_cer_verify` (0.35).
+  On Saudi podcast speech that rejects ~2% of clips, almost all genuinely
+  mis-transcribed. Clips containing English or digits are not gated: the two
+  models write those differently (`social anxiety` vs `سوشيل أنزايتي`).
+* **The model's own confidence**, gated at `filters.min_asr_confidence`
+  (−0.10 mean per-token log-probability; the tashkeel model's median is about
+  −0.03, and every clip measured below −0.10 was garbled).
+* **Subtitles, when a video has them**, force-aligned onto the clip and
+  compared with the transcript (`filters.max_cer_yt_vs_asr`). By default the
+  diacritized ASR text stays canonical (`filters.prefer_asr_text`), because
+  YouTube's captions carry neither diacritics nor reliable spelling;
+  `text_source` then reads e.g. `cohere+auto`.
+* **Speaking rate**, counted on undiacritized letters per second of *speech*
+  (not of padding), catches a transcript far too long or short for its audio.
 
-Videos with no Arabic subtitles fall back to the ASR transcript alone;
-`text_source` records which path produced each row. On that path there is no
-second opinion, so the transcriber's own confidence is gated instead. The two
-backends score on different scales and so have separate floors:
-`filters.min_asr_confidence_google` (0-1, default 0.5) and
-`filters.min_asr_confidence` (mean per-token log-probability, default -1.0).
+Every transcript stays in the metadata (`text`, `text_asr`, `text_verify`,
+`text_yt`, with `cer_verify` and `cer_yt_vs_asr`), so thresholds can be re-tuned
+against `rejected.jsonl` without recomputing anything.
 
-> The `text_cohere` and `cer_yt_vs_cohere` column names predate the Google
-> backend and are kept as they are, so datasets built before it stay readable
-> against one schema. They hold whichever backend ran.
+The Google backends have no second model and gate on their own 0–1 confidence
+(`filters.min_asr_confidence_google`). The optional Gemini transcription
+scripts send one clip per request by default; with `--max-batch` above 1 they
+still never put two clips of one video in the same request.
 
 ### Transcription backends
 
 `asr.backend` picks the transcriber; `--asr-backend` overrides it per run.
 
-| | `google` (default) | `cohere` | `google_batch` |
+| | `cohere` (default) | `google` | `google_batch` |
 |---|---|---|---|
-| Model | Cloud Speech-to-Text v1 `latest_long` | `CohereLabs/cohere-transcribe-arabic-07-2026` | Speech-to-Text **V2** `long` |
-| Unit of work | one request per chunk | one decode per chunk | one request per **episode** |
-| Needs | credentials, billed per audio minute | ~5 GB of GPU, no network | credentials **and a GCS bucket** |
-| Language choice | API detects among the configured locales | one decode pass per language | fixed `language_codes` |
-| Confidence | its own 0-1 score | mean per-token log-probability | its own 0-1 score, averaged per chunk |
+| Model | `NAMAA-Space/Cohere-Speech-Tashkeel-2B`, checked by `CohereLabs/cohere-transcribe-arabic-07-2026` | Cloud Speech-to-Text v1 `latest_long` | Speech-to-Text **V2** `long` |
+| Output | fully diacritized Arabic | undiacritized | undiacritized |
+| Unit of work | one decode per chunk, per model | one request per chunk | one request per **episode** |
+| Needs | ~10 GB of GPU, no network | credentials, billed per audio minute | credentials **and a GCS bucket** |
+| Language choice | one decode pass per language in `asr.languages` | API detects among the configured locales | fixed `language_codes` |
+| Confidence | mean per-token log-probability | its own 0-1 score | its own 0-1 score, averaged per chunk |
+
+`--asr-model` and `--verify-model` (or `none`) swap the two Cohere models.
 
 #### `google_batch`: whole episodes, a quarter of the price
 
@@ -292,57 +345,26 @@ config change.
 
 ### Tashkeel
 
-No ASR backend here emits diacritics — Cloud Speech-to-Text has no flag for it
-and returns none. `scripts/diacritize.py` adds them as a separate pass, from
-the audio, so the marks match how the speaker actually pronounced the word
-rather than what Modern Standard grammar would prescribe:
-
-```bash
-scripts/diacritize.py dataset/ --dialect najdi --workers 8
-```
-
-Two rules are enforced **in code**, not merely asked of the model
-(`yt2ds.arabic`):
-
-* **the letters must not change** — if the bare skeleton moved, the model
-  rewrote the line instead of marking it, and the row is left alone. Because
-  the comparison normalizes, a model that restores a missing hamza seat or ta
-  marbuta *is* accepted, and logged as `ok_orthography_fixed`;
-* **no mark on any word's final letter** — every accepted result goes through
-  `strip_final_tashkeel`, which clears the trailing letter and also the
-  tanwin-fath-plus-alef spelling of the same ending (`مَرْحَبًا` → `مَرْحَبا`).
-  Case endings are grammatical and inaudible in ordinary speech, so a TTS model
-  should never be taught to pronounce them.
-
-The pass is also the repair for ASR orthography. It is allowed to correct two
-things and nothing else — a bare alef whose root is a hamza, and a word-final
-ه whose root is ة — which is exactly the damage Speech-to-Text does. Measured
-over a 20-clip sample of Google `long` output, every row came back
-`ok_orthography_fixed`:
+The default transcriber writes the diacritics itself, **from the audio**:
+Cohere-Speech-Tashkeel-2B is Cohere Transcribe Arabic fine-tuned to emit fully
+diacritized text, so the marks follow what the speaker actually pronounced —
+dialectal vowels, sukun at pauses — rather than what a text-only diacritizer
+infers from spelling and Modern Standard grammar. Its model card reports a
+diacritic error rate of 5.7% (6.6% with case endings) on natural speech.
 
 ```
-before:  انقل اسئلتكم واضعها على طاوله قاده التحول.
-after :  أَنْقُل أَسْئِلَتَكُم وَأَضَعُهَا عَلَى طَاوِلَة قَادَة التَّحَوُّل.
+تَحِسّ نَفْسَكْ أَنَّكْ أَنْتَ مُسْتَنْزِفْ
+هَذَا اللِّي الْيَوْمْ بَنِتْكَلَّمْ عَنَّهْ وَبَشَارِكْكُمْ فِي نِهَايَةِ الْحَلَقَةْ
 ```
 
-Tatweel (U+0640) is stripped by `clean_for_output`: a model asked for marks will
-occasionally insert one as somewhere to hang a vowel, and being inside the
-Arabic letter range it would otherwise pose as a word's final letter and shield
-a real case ending from the rule above.
+`scripts/diacritize.py` (Gemini, audio + existing text) remains for datasets
+built before this default, or for text from another source. It enforces two
+rules in code: the letters must not change, and no mark goes on a word's final
+letter. `scripts/retranscribe.py` re-runs the default transcriber over an
+existing dataset's clips instead.
 
-`--dialect` names the expected dialect (`najdi`, `hijazi`, `gulf`, `saudi`,
-`egyptian`, `levantine`, or any string you write). It is deliberately a
-**prior, not an override**: it resolves vowels the audio leaves ambiguous, and
-the prompt says explicitly that heard pronunciation wins whenever the two
-disagree. Interview speech code-switches constantly toward MSA and a guest need
-not share the host's dialect, so a model told flatly "this is Najdi" would
-impose Najdi vowels on Modern Standard pronunciation — the exact failure mode
-that makes text-only diacritizers (Farasa, Mishkal, CATT) unusable here.
-Omitting the flag keeps the earlier dialect-agnostic prompt.
-
-`text` becomes the diacritized string and `text_cohere` keeps the undiacritized
-transcript it was built from, so nothing is lost. Results are cached per clip in
-`.work/diacritize_cache.jsonl`, so an interrupted pass resumes without re-paying.
+Tatweel (U+0640) is stripped by `clean_for_output`: it carries no sound, and
+inside the Arabic letter range it would otherwise pose as a word's final letter.
 
 ### Arabic *and* English
 
@@ -357,11 +379,12 @@ already a locale passes through, so `--languages ar-EG,en` works. Not every
 Speech-to-Text model accepts alternatives — `latest_long` does not — so the
 first rejection drops them for the rest of the run and logs that it did.
 
-**cohere** has no auto-detect: it decodes under a language prompt, and forcing
-every chunk through the Arabic prompt makes it invent Arabic for speech that is
-actually English. So each chunk is decoded once per language in `asr.languages`
-and the higher-confidence result wins, with the runner-up's score kept in
-`asr_confidence_alt`. `asr.languages: ["ar"]` halves ASR time on this backend.
+**cohere** has no auto-detect: it decodes under a language prompt. With several
+entries in `asr.languages` each chunk is decoded once per language and the
+higher-confidence result wins, with the runner-up's score kept in
+`asr_confidence_alt`. The tashkeel model is trained for Arabic, so the default
+is `["ar"]`; English words inside Arabic speech come out transliterated
+(`سوشيل أنزايتي`). Use `--languages ar,en` with a model that also writes English.
 
 Either way each row records `asr_language` and `asr_confidence`, and the script
 check (`filters.min_script_ratio`) is a proportion rather than a purity test,
@@ -375,9 +398,10 @@ scripts/setup.sh main       # main venv only
 scripts/setup.sh diarize    # diarization venv only
 ```
 
-Requires `uv`, `git`, `ffmpeg`/`ffprobe`, and an NVIDIA GPU. Set `HF_TOKEN` if
-the diarization weights need it, and `GOOGLE_APPLICATION_CREDENTIALS` for the
-default ASR backend (not needed with `--asr-backend cohere`).
+Requires `uv`, `git`, `ffmpeg`/`ffprobe`, and an NVIDIA GPU (the default set of
+models needs about 20 GB of GPU memory). Set `HF_TOKEN` if the diarization
+weights need it, and `GOOGLE_APPLICATION_CREDENTIALS` only for the Google
+backends.
 
 ### Why two virtualenvs
 
@@ -392,49 +416,82 @@ installed to override.
 
 | Stage | Model | Licence |
 |---|---|---|
-| ASR (default) | Google Cloud Speech-to-Text `latest_long` | hosted API |
-| ASR (`--asr-backend cohere`) | `CohereLabs/cohere-transcribe-arabic-07-2026` | Apache-2.0 |
+| ASR (default) | `NAMAA-Space/Cohere-Speech-Tashkeel-2B` | Apache-2.0 |
+| ASR cross-check | `CohereLabs/cohere-transcribe-arabic-07-2026` | Apache-2.0 |
+| ASR (`--asr-backend google`) | Google Cloud Speech-to-Text `latest_long` | hosted API |
 | Diarization | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` | **CC BY-NC 4.0** |
+| Speaker embedding | `Wespeaker/wespeaker-voxceleb-resnet293-LM` | CC BY 4.0 |
 | Forced alignment | `MahmoudAshraf/mms-300m-1130-forced-aligner` | CC-BY-NC-4.0 |
 | Music/event detection | `MIT/ast-finetuned-audioset-10-10-0.4593` | BSD |
 | Vocal isolation | Mel-Band RoFormer `mel_band_roformer_kim_ft_unwa` | MIT |
 | Music scoring | Demucs `htdemucs` | MIT |
-| Speaker embedding | `speechbrain/spkrec-ecapa-voxceleb` | Apache-2.0 |
 | VAD | Silero VAD | MIT |
 | Quality | TorchAudio-SQUIM | BSD |
 
-> **Licence note.** DiariZen's weights are **non-commercial**. It was chosen for
-> accuracy — DER 9.1 on VoxConverse and 14.5 on DIHARD 3, better than pyannote
-> community-1 across the board — with that trade understood. `stages/diarize.py`
-> talks to a generic worker contract, so swapping in a permissively licensed
-> diarizer is a configuration change rather than a rewrite.
+Why these, as of late 2026:
+
+* **Diarization — DiariZen-Large-s80-v2** is still the strongest open
+  diarizer. Against pyannote's open `community-1` pipeline on the benchmarks
+  both publish (DER, no collar): AMI-SDM 13.9 vs 19.9, AliMeeting 10.8 vs 20.3,
+  MSDWild 15.8 vs 22.8, DIHARD3 14.5 vs 20.2, VoxConverse 9.1 vs 11.2.
+  pyannote's `precision-2` is better again but runs only on pyannoteAI's cloud;
+  NVIDIA Sortformer is capped at four speakers. The weights are
+  **non-commercial**; `community-1` (CC BY 4.0) is the permissive alternative,
+  and `stages/diarize.py` talks to a generic worker contract, so swapping is a
+  configuration change rather than a rewrite.
+* **Speaker embedding — WeSpeaker ResNet293** replaced ECAPA-TDNN. Measured on
+  this project's Saudi podcast audio (2,185 clips, 18 episodes, DiariZen's
+  within-episode labels as ground truth): equal error rate 2.94% → 2.32% within
+  episodes, and 2.72% → 1.58% host-versus-guest across episodes — the comparison
+  speaker linking depends on. It runs on the GPU from the official checkpoint
+  through a small local port of the network (`yt2ds.embedders`), verified
+  identical to WeSpeaker's ONNX export. The distance thresholds in
+  `speakers.*` are calibrated for it.
+* **ASR — Cohere-Speech-Tashkeel-2B** gives diacritized text directly from the
+  audio; its parent, Cohere Transcribe Arabic, serves as the independent check.
+* **VAD — Silero** stays: no independent benchmark shows a successor (TEN VAD's
+  claims are its own) clearly better at speech *boundaries*, which is what
+  matters here, and boundary precision is enforced by the segmenter anyway.
+* **Vocal isolation — Mel-Band RoFormer.** BS/Mel-RoFormer variants lead the
+  music-separation leaderboards; none is benchmarked on speech. For audio with
+  no music at all, `--no-separate` avoids separator artefacts entirely.
 
 ## Output
 
 ```
 dataset/
-├── wavs/                 # 24 kHz mono 16-bit PCM, one folder per speaker
-│   ├── <speaker>/        # <video_id>_SPK<n> during a run; GLOBAL_SPEAKER_nn
-│   │                     # after `report --link-speakers` pools voices
-│   └── _unassigned/      # clips whose speaker pooled under
-│                         # speakers.min_speaker_seconds -- diarization debris
+├── wavs/                 # 24 kHz mono 16-bit PCM
+│   └── <video_id>_SPK<n>/  # one folder per per-video speaker
+├── speakers/             # written by `yt2ds speakers`: one folder per voice
+│   ├── report.json
+│   ├── GLOBAL_SPEAKER_00/  # wavs/ (hardlinks) + metadata.jsonl + speaker.json
+│   └── _unassigned/
 ├── metadata.jsonl        # one line per kept clip
 ├── rejected.jsonl        # every dropped clip + reason + scores
-├── speakers.json         # per-speaker hours, global speaker links
+├── speakers.json         # per-speaker hours (from `yt2ds report`)
 ├── manifest.json         # run config, per-video summary
 ├── failed.txt            # URLs that failed + why; feed back with --urls-file
 ├── mp3/                  # archival full-length audio, only with --keep-mp3
 └── .work/                # state + speaker centroids; safe to delete
 ```
 
-Each `metadata.jsonl` row carries the text (`text`, `text_yt`, `text_cohere` —
-the ASR transcript whichever backend produced it, `text_source`,
-`cer_yt_vs_cohere`), the language it was decoded in
-(`language`, `asr_language`, `asr_confidence`, `asr_confidence_alt` on
-`cohere`), the
-speaker (`speaker`, `global_speaker`, `speaker_conf`), and every quality score
-behind the keep/drop decision (`squim_mos`, `squim_stoi`, `squim_pesq`,
-`music_score`, `vocal_ratio`, `snr_db`, `chars_per_sec`, `script_ratio`, …).
+Each `metadata.jsonl` row carries:
+
+* **text** — `text` (canonical), `text_source`, `text_asr`, `text_verify`,
+  `cer_verify`, `text_yt`, `cer_yt_vs_asr`, `asr_language`, `asr_confidence`,
+  `verify_confidence`;
+* **timing** — `start`/`end` of the clip in the source, `speech_start`/
+  `speech_end` of the speech inside it, `voiced_seconds`, `max_internal_pause`;
+* **speaker** — `speaker` (per video), `global_speaker`, `speaker_conf`,
+  `speaker_distance`, `global_speaker_distance`;
+* **level** — `lufs` and `out_peak_dbfs` of the written clip, `gain_db`,
+  `gain_limited_db`, and `source_lufs` of the whole episode;
+* every quality score behind the keep/drop decision (`squim_mos`,
+  `squim_stoi`, `squim_pesq`, `music_score`, `snr_db`, `chars_per_sec`,
+  `script_ratio`, …).
+
+Datasets written before these names keep `text_cohere` / `cer_yt_vs_cohere`;
+the scripts read either.
 
 Runs are resumable: finished videos are skipped on a re-run, and adding a URL
 to an existing dataset only processes the new video. A video interrupted
@@ -442,6 +499,33 @@ mid-write has its partial rows cleared before it is reprocessed, so
 `metadata.jsonl` never accumulates duplicates. `.work/` holds only the state
 and speaker centroids once a video is done — the bulky decodes are cleaned up
 as the run goes.
+
+## Speaker folders
+
+```bash
+yt2ds speakers dataset/                     # link voices, write speakers/
+yt2ds speakers dataset/ --report-only       # just print the ranking
+yt2ds speakers dataset/ --only GLOBAL_SPEAKER_00 --threshold 0.38
+```
+
+Diarization names speakers per episode, so a host across a hundred episodes
+arrives as a hundred `SPKn` labels. `yt2ds speakers` pools them:
+
+1. Per-episode speaker centroids are clustered across the corpus (average
+   linkage, `speakers.link_threshold`, 0.40 for ResNet293). `GLOBAL_SPEAKER_00`
+   is the voice with the most audio.
+2. An identity pooling under `speakers.min_speaker_seconds` (30 s) is
+   diarization debris — an intro voice-over, crosstalk.
+3. **Every clip is checked against its voice.** A clip further than
+   `speakers.max_clip_distance` (0.45) from the voice's centroid was mislabelled
+   by the diarizer and goes to `_unassigned/`. A centroid can be right while
+   one of its clips is wrong, and one wrong clip is what poisons a cloned voice.
+
+Each `speakers/GLOBAL_SPEAKER_nn/` is a complete dataset root (`wavs/` +
+`metadata.jsonl`), ready to train on or upload
+(`scripts/upload_speakers_to_hf.py`). Clips are hardlinks, so the split costs no
+disk; re-running replaces the previous split. The chosen voice is also written
+back into the dataset's own `metadata.jsonl` as `global_speaker`.
 
 ## Quality gates
 
@@ -457,16 +541,16 @@ All configurable in `configs/default.yaml` or via CLI flags:
   "vocals".
 - **Overlapped speech** — discarded outright. Two voices in one clip is poison
   for voice cloning. `--keep-overlap` disables this.
-- **Speaker purity** — every chunk is embedded with ECAPA and compared to its
-  own speaker's centroid; outliers are dropped. Diarization error rate is
+- **Speaker purity** — every chunk is embedded with WeSpeaker ResNet293 and
+  compared to its own speaker's centroid; outliers are dropped. Diarization error rate is
   measured over whole recordings, but what matters here is whether *this clip*
   contains *that voice*.
 - **Audio quality** — SQUIM estimated MOS / STOI / PESQ, plus clipping, peak
   level and SNR.
-- **Text** — the CER gate above, plus the script check, word count, ASR
-  confidence, and characters-per-second bounds that catch both bled-in and
-  missing text. Those bounds are calibrated for Arabic script (measured speech
-  runs 5–13 chars/sec), which is far more compact than Latin.
+- **Text** — the cross-check against the verify model, the subtitle CER gate,
+  the script check, word count, ASR confidence, and characters-per-second
+  bounds that catch both bled-in and missing text. Rates are counted on
+  undiacritized letters per second of speech (measured Arabic speech runs 5–13).
 
 ## MP3 note
 
@@ -487,9 +571,11 @@ demand for that, then deleted with the rest.
 ```
 
 Tests cover Arabic normalization and CER, subtitle parsing (including
-YouTube's rolling auto-caption repetition), the chunker's boundary rules, and
-the ASR backends' request/response mapping (no credentials needed — the API
-call itself is stubbed).
+YouTube's rolling auto-caption repetition), the chunker's boundary guarantees
+(on 200 random conversations), clip rendering (loudness, peak ceiling, fades),
+the ASR backends' request/response mapping including long-audio row
+regrouping, the speaker-embedding network, and the speaker split (no
+credentials or model downloads needed — models and APIs are stubbed).
 
 ## Provenance
 

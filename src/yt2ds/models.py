@@ -1,10 +1,9 @@
 """Lazy, cached model registry.
 
 Every GPU model is loaded on first use and then kept resident. The full set
-(Cohere 2B + Demucs + AST + ECAPA + MMS + SQUIM) fits comfortably in well under
-half of a 48 GB card, so paying the load cost once per run rather than once per
-video is the right trade. On the default ASR backend the Cohere 2B is never
-loaded at all, which takes the resident set well below that again.
+(two 2B Cohere models + Demucs + AST + ResNet293 + MMS + SQUIM + the vocal
+isolator) fits in about half of a 48 GB card, so paying the load cost once per
+run rather than once per video is the right trade.
 
 The Google Speech-to-Text client lives here too. It is not a model, but it is
 built once and reused for the same reason.
@@ -157,18 +156,16 @@ class ModelRegistry:
 
     @property
     def speaker_encoder(self) -> Any:
-        """ECAPA-TDNN speaker embeddings for chunk purity and cross-video linking."""
+        """Speaker embeddings for chunk purity and cross-video linking.
+
+        WeSpeaker ResNet293 by default, ECAPA-TDNN for a ``speechbrain/`` name;
+        see :mod:`yt2ds.embedders`.
+        """
 
         def load():
-            from speechbrain.inference.speaker import EncoderClassifier
+            from .embedders import load_encoder
 
-            return EncoderClassifier.from_hparams(
-                source=self.cfg.speakers.embed_model,
-                savedir=f".cache/speechbrain/{self.cfg.speakers.embed_model.replace('/', '_')}",
-                # SpeechBrain parses the device string itself and cannot handle
-                # a bare "cuda", so hand it an explicit index.
-                run_opts={"device": self.device_string},
-            )
+            return load_encoder(self.cfg.speakers.embed_model, self.device)
 
         return self._get("speaker_encoder", load)
 
@@ -201,23 +198,28 @@ class ModelRegistry:
 
     @property
     def asr(self) -> tuple[Any, Any]:
-        """Cohere Transcribe Arabic (processor, model), the ``cohere`` backend.
+        """The ``cohere`` backend's transcription model (processor, model).
 
         Emits no timestamps, which is why the pipeline segments the audio first
         and runs this per chunk.
         """
+        return self._get("asr", lambda: self._load_cohere(self.cfg.asr.model))
 
-        def load():
-            from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+    @property
+    def asr_verify(self) -> tuple[Any, Any]:
+        """The independent second transcriber behind ``filters.max_cer_verify``."""
+        name = self.cfg.asr.verify_model
+        if name == self.cfg.asr.model:
+            return self.asr
+        return self._get("asr_verify", lambda: self._load_cohere(name))
 
-            name = self.cfg.asr.model
-            dtype = _DTYPES[self.cfg.asr.dtype]
-            processor = AutoProcessor.from_pretrained(name)
-            model = CohereAsrForConditionalGeneration.from_pretrained(name, dtype=dtype)
-            model.to(self.device).eval()
-            return processor, model
+    def _load_cohere(self, name: str) -> tuple[Any, Any]:
+        from transformers import AutoProcessor, CohereAsrForConditionalGeneration
 
-        return self._get("asr", load)
+        processor = AutoProcessor.from_pretrained(name)
+        model = CohereAsrForConditionalGeneration.from_pretrained(name, dtype=_DTYPES[self.cfg.asr.dtype])
+        model.to(self.device).eval()
+        return processor, model
 
     @property
     def aligner(self) -> tuple[Any, Any, Any]:

@@ -7,7 +7,7 @@ import pytest
 
 from yt2ds.config import Config
 from yt2ds.stages.segment import Chunk
-from yt2ds.stages.speakers import _robust_centroid, link_across_videos, verify_purity
+from yt2ds.stages.speakers import robust_centroid, link_across_videos, verify_purity
 
 
 @pytest.fixture
@@ -69,12 +69,12 @@ class TestRobustCentroid:
         # clean cluster rather than being dragged between the two.
         clean = [unit([1.0, 0.0, 0.0])] * 6
         dirty = [unit([0.0, 1.0, 0.0])] * 2
-        centroid = _robust_centroid(np.stack(clean + dirty))
+        centroid = robust_centroid(np.stack(clean + dirty))
         assert float(centroid @ unit([1.0, 0.0, 0.0])) > 0.99
 
     def test_small_sample_uses_the_plain_mean(self):
         vectors = np.stack([unit([1.0, 0.0, 0.0]), unit([0.0, 1.0, 0.0])])
-        centroid = _robust_centroid(vectors)
+        centroid = robust_centroid(vectors)
         assert float(np.linalg.norm(centroid)) == pytest.approx(1.0, abs=1e-5)
 
 

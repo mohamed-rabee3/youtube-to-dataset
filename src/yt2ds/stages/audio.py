@@ -12,9 +12,11 @@ downstream reads it: encoding to MP3 and then cutting TTS clips out of the
 decoded result would bake compression artefacts into training data. Set
 ``audio.chunk_from_mp3`` if that trade is wanted anyway.
 
-Loudness is *measured* here and applied at emit time. Normalizing per video
-rather than per chunk keeps the relative dynamics between a speaker's loud and
-quiet passages intact, which a voice-cloning model needs.
+Loudness is *measured* here and applied when clips are written, by
+:func:`render_clip`: per clip by default, so the whole dataset sits at one
+level, or per video (``audio.loudness: video``) to keep a speaker's loud and
+quiet passages in proportion. Either way the gain is capped so no written
+sample exceeds ``audio.peak_ceiling_dbfs``.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import Config
+from ..config import AudioConfig, Config
 from ..io import Workspace
 from .download import VideoAssets
 
@@ -182,16 +184,91 @@ def read_segment(path: Path, sr: int, start: float, end: float) -> np.ndarray:
     return np.ascontiguousarray(data, dtype=np.float32)
 
 
-def apply_gain(samples: np.ndarray, gain_db: float, peak_ceiling_dbfs: float = -1.0) -> np.ndarray:
-    """Apply loudness gain, backing it off if it would push the peak into clipping."""
-    if not np.isfinite(gain_db) or gain_db == 0.0 or samples.size == 0:
-        return samples
-    gain = 10.0 ** (gain_db / 20.0)
+@dataclass
+class RenderedClip:
+    samples: np.ndarray
+    # Gain applied, and how much of the wanted gain the peak ceiling withheld.
+    gain_db: float
+    gain_limited_db: float
+    # Loudness and peak of the clip as written.
+    lufs: float | None
+    peak_dbfs: float | None
+
+
+def render_clip(
+    samples: np.ndarray,
+    source_sr: int,
+    audio_cfg: AudioConfig,
+    video_gain_db: float,
+) -> RenderedClip:
+    """Turn a cut of the master into the clip that is written.
+
+    Order matters. Resampling comes first, so the peak ceiling is enforced on
+    the samples that are actually written -- a resampler can overshoot the
+    source's peak, and a ceiling checked before it would not hold after. The
+    gain is then the configured loudness target, backed off only as far as the
+    ceiling demands, so no sample is ever hard-clipped by the 16-bit writer.
+    """
+    out_sr = audio_cfg.out_sample_rate
+    samples = resample(samples, source_sr, out_sr)
+    if samples.size == 0:
+        return RenderedClip(samples, 0.0, 0.0, None, None)
+
+    mode = audio_cfg.loudness.lower()
+    if mode == "clip":
+        measured = integrated_loudness(samples, out_sr)
+        wanted = audio_cfg.target_lufs - measured if measured is not None else video_gain_db
+    elif mode == "video":
+        wanted = video_gain_db
+    else:
+        raise ValueError(f"unknown audio.loudness: {audio_cfg.loudness!r} (expected 'clip' or 'video')")
+    wanted = wanted if np.isfinite(wanted) else 0.0
+
     peak = float(np.max(np.abs(samples)))
-    if peak > 0:
-        ceiling = 10.0 ** (peak_ceiling_dbfs / 20.0)
-        gain = min(gain, ceiling / peak)
-    return (samples * gain).astype(np.float32)
+    allowed = audio_cfg.peak_ceiling_dbfs - 20 * np.log10(peak) if peak > 0 else wanted
+    gain = min(wanted, allowed)
+    out = (samples * 10.0 ** (gain / 20.0)).astype(np.float32)
+    apply_fades(out, out_sr, audio_cfg.fade_ms)
+
+    out_peak = float(np.max(np.abs(out)))
+    return RenderedClip(
+        samples=out,
+        gain_db=round(float(gain), 3),
+        gain_limited_db=round(float(max(0.0, wanted - gain)), 3),
+        lufs=_round(integrated_loudness(out, out_sr)),
+        peak_dbfs=round(20 * np.log10(out_peak), 3) if out_peak > 0 else None,
+    )
+
+
+def apply_fades(samples: np.ndarray, sr: int, fade_ms: float) -> None:
+    """Raised-cosine fade-in and fade-out, in place."""
+    n = min(int(round(fade_ms * sr / 1000.0)), samples.size // 4)
+    if n <= 1:
+        return
+    ramp = (0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, n))).astype(np.float32)
+    samples[:n] *= ramp
+    samples[-n:] *= ramp[::-1]
+
+
+def integrated_loudness(samples: np.ndarray, sr: int) -> float | None:
+    """BS.1770 integrated loudness, or None where it is undefined.
+
+    Undefined means under one 400 ms gating block, or nothing above the
+    absolute gate -- silence has no loudness to normalize to.
+    """
+    import pyloudnorm
+
+    if samples.size < int(0.4 * sr):
+        return None
+    try:
+        value = float(pyloudnorm.Meter(sr).integrated_loudness(samples.astype(np.float64)))
+    except Exception:  # noqa: BLE001 - pyloudnorm raises bare exceptions
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _round(value: float | None) -> float | None:
+    return round(value, 3) if value is not None else None
 
 
 def resample(samples: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:

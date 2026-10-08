@@ -12,12 +12,11 @@ AudioVAE encoder expects, and write the manifest.
 
 Two choices worth knowing about:
 
-*Transcript.* yt2ds stores YouTube's auto-caption as the canonical ``text``,
-which is right for ASR provenance and wrong for TTS: YouTube's Arabic captions
-drop ta marbuta, hamza seats and nearly all punctuation. A TTS model trained on
-that spelling never learns the mapping from ordinary written Arabic. Cohere's
-transcript keeps the real orthography, and the pipeline already gated every row
-on the two transcripts agreeing, so it is the default here.
+*Transcript.* ``text`` is the canonical transcript: the diacritized ASR text,
+already checked against a second model (and against the subtitles, where a
+video had them). ``--text asr`` takes the raw ASR column instead and
+``--text youtube`` the captions, which drop ta marbuta, hamza seats and nearly
+all punctuation and are wrong for TTS.
 
 *Reference audio.* Each row gets a second clip of the same speaker as
 ``ref_audio``, which trains VoxCPM in its prompted / voice-cloning mode. Pass
@@ -71,8 +70,8 @@ def clean_text(text: str) -> str:
 
 
 def pick_text(row: dict, mode: str) -> str:
-    if mode == "cohere":
-        return row.get("text_cohere") or row.get("text") or ""
+    if mode == "asr":
+        return row.get("text_asr") or row.get("text_cohere") or row.get("text") or ""
     if mode == "youtube":
         return row.get("text_yt") or row.get("text") or ""
     return row.get("text") or ""
@@ -395,8 +394,8 @@ def main(argv=None) -> int:
     p.add_argument("--out", type=Path, required=True, help="output directory")
     p.add_argument(
         "--text",
-        choices=["cohere", "youtube", "canonical"],
-        default="cohere",
+        choices=["canonical", "asr", "youtube"],
+        default="canonical",
         help="which transcript to train on",
     )
     p.add_argument(

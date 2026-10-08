@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor

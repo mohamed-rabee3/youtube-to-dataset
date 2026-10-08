@@ -11,18 +11,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
 
 from .config import Config
 from .io import Workspace, read_jsonl, write_json
 
 
 # Where clips land when their speaker pooled less than min_speaker_seconds.
-_UNASSIGNED = "_unassigned"
 
 
 def _setup_logging(verbosity: int) -> None:
@@ -121,16 +118,22 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-music", type=float, help="max AST music score")
     run.add_argument("--max-accompaniment", type=float, help="max Demucs accompaniment energy ratio")
     run.add_argument("--min-duration", type=float, help="minimum chunk seconds")
-    run.add_argument("--max-duration", type=float, help="maximum chunk seconds")
+    run.add_argument("--max-duration", type=float, help="maximum seconds of speech per chunk")
     run.add_argument("--out-sample-rate", type=int, help="output WAV sample rate")
     run.add_argument("--keep-overlap", action="store_true", help="do not discard overlapped speech")
     run.add_argument(
         "--asr-backend",
         choices=["google", "cohere", "google_batch"],
-        help="transcription backend: google = per-chunk Cloud Speech-to-Text (default, needs "
-        "credentials, billed per audio minute), cohere = local Cohere Transcribe Arabic on the "
-        "GPU, google_batch = whole-episode V2 BatchRecognize -- this run emits chunks without "
-        "text and `yt2ds transcribe` fills them in, far cheaper than per-chunk requests",
+        help="transcription backend: cohere = local GPU models (default: diacritized "
+        "transcript from Cohere-Speech-Tashkeel-2B, cross-checked by Cohere Transcribe Arabic), "
+        "google = per-chunk Cloud Speech-to-Text (needs credentials, billed per audio minute), "
+        "google_batch = whole-episode V2 BatchRecognize -- this run emits chunks without text "
+        "and `yt2ds transcribe` fills them in",
+    )
+    run.add_argument("--asr-model", help="Hub id of the cohere backend's transcription model")
+    run.add_argument(
+        "--verify-model",
+        help="Hub id of the cohere backend's cross-check model, or 'none' to skip the check",
     )
     run.add_argument(
         "--google-asr-model",
@@ -144,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--languages",
-        help="comma-separated ASR languages (default: ar,en). On google the first is the primary "
+        help="comma-separated ASR languages (default: ar). On google the first is the primary "
         "and the rest are alternatives it detects among; on cohere each chunk is decoded once per "
         "language and the highest-confidence result wins. Use 'ar' alone for Arabic-only material.",
     )
@@ -179,22 +182,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report", help="summarize an existing dataset")
     report.add_argument("dataset", type=Path)
-    report.add_argument("--link-speakers", action="store_true", help="cluster speakers across videos")
-    report.add_argument(
-        "--link-threshold",
-        type=float,
-        help="cosine distance below which two per-video speakers are the same voice (default 0.35); "
-        "raise to pool a voice recorded under varying conditions, lower if distinct people are merging",
-    )
-    report.add_argument(
-        "--min-speaker-seconds",
-        type=float,
-        help="a global speaker pooling less than this many seconds is debris, not a voice; "
-        "its clips go to _unassigned/ (default 30). 0 disables the floor",
-    )
     report.add_argument("--config", type=Path)
     report.add_argument("-v", "--verbose", action="count", default=0)
     report.add_argument("-q", "--quiet", action="store_true")
+
+    voices = sub.add_parser(
+        "speakers",
+        help="link speakers across videos and write one folder per voice under <dataset>/speakers/",
+    )
+    voices.add_argument("dataset", type=Path)
+    voices.add_argument(
+        "--threshold",
+        type=float,
+        help="cosine distance below which two per-video speakers are the same voice (default 0.40); "
+        "raise to pool a voice recorded under varying conditions, lower if distinct people merge",
+    )
+    voices.add_argument(
+        "--min-seconds",
+        type=float,
+        help="a voice pooling less audio than this is diarization debris and goes to _unassigned/ "
+        "(default 30); 0 keeps every identity",
+    )
+    voices.add_argument(
+        "--max-clip-distance",
+        type=float,
+        help="a clip further than this from its voice's centroid goes to _unassigned/ (default 0.45)",
+    )
+    voices.add_argument("--only", help="comma-separated voices to write, e.g. GLOBAL_SPEAKER_00")
+    voices.add_argument("--out", type=Path, help="output root (default <dataset>/speakers)")
+    voices.add_argument("--report-only", action="store_true", help="print the ranking, write nothing")
+    voices.add_argument("--config", type=Path)
+    voices.add_argument("-v", "--verbose", action="count", default=0)
+    voices.add_argument("-q", "--quiet", action="store_true")
 
     return parser
 
@@ -216,7 +235,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "runtime.download_workers": args.workers,
         "runtime.device": args.device,
         "quality.min_mos": args.min_mos,
-        "filters.max_cer_yt_vs_cohere": args.max_cer,
+        "filters.max_cer_yt_vs_asr": args.max_cer,
         "music.max_music_score": args.max_music,
         "music.max_accompaniment_ratio": args.max_accompaniment,
         "segment.min_duration": args.min_duration,
@@ -225,7 +244,11 @@ def _overrides(args: argparse.Namespace) -> dict[str, object]:
         "separate.model": getattr(args, "separate_model", None),
         "asr.backend": getattr(args, "asr_backend", None),
         "asr.google.model": getattr(args, "google_asr_model", None),
+        "asr.model": getattr(args, "asr_model", None),
     }
+    verify = getattr(args, "verify_model", None)
+    if verify is not None:
+        mapping["asr.verify_model"] = "" if verify.lower() == "none" else verify
     if getattr(args, "google_credentials", None):
         mapping["asr.google.credentials_file"] = str(args.google_credentials)
     if getattr(args, "no_separate", False):
@@ -400,11 +423,6 @@ def _rewrite_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    overrides = {
-        "speakers.link_threshold": getattr(args, "link_threshold", None),
-        "speakers.min_speaker_seconds": getattr(args, "min_speaker_seconds", None),
-    }
-    cfg = Config.load(args.config, {k: v for k, v in overrides.items() if v is not None})
     ws = Workspace(args.dataset)
     if not ws.metadata.exists():
         raise SystemExit(f"no metadata.jsonl in {ws.root}")
@@ -419,7 +437,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     for row in rows:
         duration = float(row.get("duration") or 0.0)
         total += duration
-        per_speaker[row.get("speaker", "?")] += duration
+        per_speaker[row.get("global_speaker") or row.get("speaker", "?")] += duration
         per_video[row.get("video_id", "?")] += duration
         per_source[row.get("text_source", "?")] += 1
 
@@ -434,7 +452,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     print("\ntext source:")
     for source, count in sorted(per_source.items(), key=lambda kv: -kv[1]):
-        print(f"  {source:<12} {count:>6}")
+        print(f"  {source:<16} {count:>6}")
 
     if reasons:
         print("\nrejection reasons:")
@@ -442,149 +460,35 @@ def cmd_report(args: argparse.Namespace) -> int:
             share = 100 * count / max(len(rejected), 1)
             print(f"  {reason:<12} {count:>6}  ({share:4.1f}%)")
 
-    linked = _link_speakers(ws, cfg, per_speaker) if args.link_speakers else {}
-    if linked:
-        _rewrite_global_speakers(ws, linked)
-        pooled: dict[str, float] = defaultdict(float)
-        for row in read_jsonl(ws.metadata):
-            if row.get("global_speaker"):
-                pooled[row["global_speaker"]] += float(row.get("duration") or 0.0)
-        print(f"\nglobal speakers after linking: {len(pooled)} (from {len(per_speaker)} per-video)")
-        for speaker, seconds in sorted(pooled.items(), key=lambda kv: -kv[1])[:15]:
-            print(f"  {speaker:<22} {seconds / 60:7.1f} min")
-    else:
-        print("\ntop speakers:")
-        for speaker, seconds in sorted(per_speaker.items(), key=lambda kv: -kv[1])[:15]:
-            print(f"  {speaker:<28} {seconds / 60:7.1f} min")
+    print("\ntop speakers:")
+    for speaker, seconds in sorted(per_speaker.items(), key=lambda kv: -kv[1])[:15]:
+        print(f"  {speaker:<28} {seconds / 60:7.1f} min")
 
-    write_json(
-        ws.speakers,
-        {
-            "per_speaker_seconds": dict(per_speaker),
-            "per_video_seconds": dict(per_video),
-            "global_speakers": linked,
-        },
-    )
+    write_json(ws.speakers, {"per_speaker_seconds": dict(per_speaker), "per_video_seconds": dict(per_video)})
     return 0
 
 
-def _link_speakers(ws: Workspace, cfg: Config, per_speaker: dict[str, float]) -> dict[str, str]:
-    """Cluster the per-video speaker centroids saved during the run.
+def cmd_speakers(args: argparse.Namespace) -> int:
+    from .speaker_split import print_report, split
 
-    Kept seconds per speaker are passed through so global labels are numbered
-    by how much usable audio each voice has.
-    """
-    from .stages.speakers import link_across_videos
+    overrides = {
+        "speakers.link_threshold": args.threshold,
+        "speakers.min_speaker_seconds": args.min_seconds,
+        "speakers.max_clip_distance": args.max_clip_distance,
+    }
+    cfg = Config.load(args.config, {k: v for k, v in overrides.items() if v is not None})
+    ws = Workspace(args.dataset)
+    if not ws.metadata.exists():
+        raise SystemExit(f"no metadata.jsonl in {ws.root}")
 
-    centroids: dict[str, np.ndarray] = {}
-    for path in sorted(ws.embeddings.glob("*.npz")):
-        with np.load(path) as data:
-            for key in data.files:
-                centroids[key] = data[key]
-    if not centroids:
-        print("\nno speaker embeddings found; run the pipeline first", file=sys.stderr)
-        return {}
-    linked = link_across_videos(centroids, cfg.speakers.link_threshold, weights=per_speaker)
-    return _drop_thin_speakers(linked, per_speaker, cfg.speakers.min_speaker_seconds)
-
-
-def _drop_thin_speakers(
-    linked: dict[str, str],
-    per_speaker: dict[str, float],
-    min_seconds: float,
-) -> dict[str, str]:
-    """Unassign global identities that pooled too little audio to be a voice.
-
-    Diarization splits off a cluster for every scrap it cannot place -- an
-    intro voiceover, a burst of crosstalk, a few seconds of phone audio. Each
-    is a real cluster and survives linking, so without a floor a two-person
-    interview yields ten "speakers", eight of them holding seconds.
-
-    The floor is applied to the *pooled* total rather than per video: a genuine
-    voice accumulates across the corpus, while debris stays debris no matter
-    how many videos it appears in. Survivors are renumbered contiguously so the
-    labels stay dense, still ordered by duration.
-    """
-    if min_seconds <= 0:
-        return linked
-
-    pooled: dict[str, float] = defaultdict(float)
-    for key, label in linked.items():
-        pooled[label] += per_speaker.get(key, 0.0)
-
-    keep = [label for label in pooled if pooled[label] >= min_seconds]
-    if len(keep) == len(pooled):
-        return linked
-
-    order = sorted(keep, key=lambda label: -pooled[label])
-    renumbered = {label: f"GLOBAL_SPEAKER_{i:02d}" for i, label in enumerate(order)}
-    dropped = len(pooled) - len(keep)
-    dropped_seconds = sum(pooled[label] for label in pooled if label not in renumbered)
-    print(
-        f"\ndropped {dropped} speaker(s) under {min_seconds:.0f}s "
-        f"({dropped_seconds / 60:.1f} min total) -> {_UNASSIGNED}/"
-    )
-    return {key: renumbered[label] for key, label in linked.items() if label in renumbered}
-
-
-def _rewrite_global_speakers(ws: Workspace, linked: dict[str, str]) -> None:
-    """Fill in the ``global_speaker`` column now that clustering has run.
-
-    The run wrote each clip under its per-video speaker folder, which is the
-    finest split available while videos are processed one at a time. Now that
-    the same voice has been recognised across videos, the clips move into one
-    directory per global identity -- so a podcast host across two hundred
-    episodes ends up as a single folder rather than two hundred.
-    """
-    rows = list(read_jsonl(ws.metadata))
-    for row in rows:
-        row["global_speaker"] = linked.get(row.get("speaker", ""))
-    _regroup_wavs(ws, rows)
-    tmp = ws.metadata.with_suffix(".jsonl.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    tmp.replace(ws.metadata)
-
-
-def _regroup_wavs(ws: Workspace, rows: list[dict[str, object]]) -> None:
-    """Move each clip into ``wavs/<global_speaker>/`` and update its row.
-
-    Filenames already carry the video id, so clips pooled from different videos
-    cannot collide. A row whose file is missing -- an older flat dataset, or a
-    move this already did on a previous run -- is left alone rather than
-    failing the report.
-    """
-    moved = 0
-    touched: set[Path] = set()
-    for row in rows:
-        old = str(row.get("audio_file") or "")
-        if not old:
-            continue
-        # A clip whose speaker did not clear the duration floor is not deleted
-        # -- it is real audio with a real transcript, just of an identity too
-        # thin to name. It goes to one drawer so the numbered folders stay
-        # clean and it can still be recovered.
-        speaker = row.get("global_speaker") or _UNASSIGNED
-        new = f"{speaker}/{Path(old).name}"
-        if new == old:
-            continue
-        source = ws.wavs / old
-        if not source.exists():
-            continue
-        target = ws.wavs / new
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source.replace(target)
-        row["audio_file"] = new
-        touched.add(source.parent)
-        moved += 1
-
-    for directory in touched:
-        # The per-video folders are empty once their clips have gone.
-        if directory != ws.wavs and directory.is_dir() and not any(directory.iterdir()):
-            directory.rmdir()
-    if moved:
-        print(f"\nregrouped {moved} clip(s) into per-speaker folders under {ws.wavs}")
+    only = {name.strip() for name in args.only.split(",") if name.strip()} if args.only else None
+    result = split(ws, cfg, out_root=args.out, only=only, write=not args.report_only)
+    print_report(result.summary)
+    if args.report_only:
+        print("\nreport only: nothing written")
+    else:
+        print(f"\nspeaker folders written under {args.out or ws.root / 'speakers'}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -598,6 +502,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_transcribe(args)
     if args.command == "report":
         return cmd_report(args)
+    if args.command == "speakers":
+        return cmd_speakers(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from yt2ds.arabic import cer, clean_for_output  # noqa: E402
 from yt2ds.config import Config  # noqa: E402
 from yt2ds.models import ModelRegistry  # noqa: E402
-from yt2ds.stages import asr, filters  # noqa: E402
+from yt2ds.stages import asr, asr_cohere, filters  # noqa: E402
 from yt2ds.stages.segment import Chunk  # noqa: E402
 
 log = logging.getLogger("retranscribe")
@@ -63,7 +63,9 @@ REFRESHED_SCORES = (
     "asr_confidence",
     "asr_language",
     "asr_confidence_alt",
-    "cer_yt_vs_cohere",
+    "cer_yt_vs_asr",
+    "cer_verify",
+    "verify_confidence",
     "arabic_ratio",
     "script_ratio",
     "chars_per_sec",
@@ -76,7 +78,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("datasets", nargs="+", type=Path, help="dataset directories")
     parser.add_argument("--config", type=Path, help="YAML config (defaults to configs/default.yaml)")
-    parser.add_argument("--backend", default="google", choices=["google", "cohere"])
+    parser.add_argument("--backend", default="cohere", choices=["google", "cohere"])
+    parser.add_argument("--asr-model", help="cohere backend transcription model (default: from config)")
+    parser.add_argument("--verify-model", help="cohere backend cross-check model, or 'none' (default: from config)")
     parser.add_argument("--google-asr-model", help="Speech-to-Text model (default: from config)")
     parser.add_argument("--google-credentials", type=Path, help="service-account JSON")
     parser.add_argument("--languages", help="comma-separated ASR languages (default: from config)")
@@ -98,6 +102,10 @@ def main(argv: list[str] | None = None) -> int:
         overrides["asr.google.model"] = args.google_asr_model
     if args.google_credentials:
         overrides["asr.google.credentials_file"] = str(args.google_credentials)
+    if args.asr_model:
+        overrides["asr.model"] = args.asr_model
+    if args.verify_model:
+        overrides["asr.verify_model"] = "" if args.verify_model.lower() == "none" else args.verify_model
     if args.languages:
         overrides["asr.languages"] = [x.strip() for x in args.languages.split(",") if x.strip()]
     cfg = Config.load(args.config, overrides)
@@ -171,12 +179,15 @@ def _transcribe(dataset: Path, todo: list[dict], cfg: Config, registry, cache: d
                 group = [(c, s) for c, s, r, _ in items if r == rate]
                 rows_for = [row for _, _, r, row in items if r == rate]
                 texts = asr.transcribe_batch(group, rate, cfg, registry)
-                for (chunk, _), row, text in zip(group, rows_for, texts):
+                verified = _verify(group, texts, rate, cfg, registry)
+                for (chunk, _), row, text, check in zip(group, rows_for, texts, verified):
                     entry = {
                         "audio_file": row["audio_file"],
                         "text": text,
+                        "text_verify": check,
                         "asr_confidence": chunk.scores.get("asr_confidence"),
                         "asr_language": chunk.scores.get("asr_language"),
+                        "verify_confidence": chunk.scores.get("verify_confidence"),
                     }
                     cache[row["audio_file"]] = entry
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -189,6 +200,17 @@ def _transcribe(dataset: Path, todo: list[dict], cfg: Config, registry, cache: d
                 "%s: %d/%d clips (%.1f clips/s, ~%.0f min left)",
                 dataset, done, len(todo), rate_per_s, remaining / 60,
             )
+
+
+def _verify(group, texts: list[str], rate: int, cfg: Config, registry) -> list[str]:
+    """The cohere backend's independent second transcript of each clip ("" when off)."""
+    if cfg.asr.backend != "cohere" or not cfg.asr.verify_model:
+        return [""] * len(group)
+    texted = [i for i, text in enumerate(texts) if text]
+    out = [""] * len(group)
+    for i, check in zip(texted, asr_cohere.verify_batch([group[i] for i in texted], rate, cfg, registry)):
+        out[i] = check
+    return out
 
 
 def _rebuild(dataset: Path, live: list[dict], cache: dict, cfg: Config) -> tuple[list[dict], list[dict], dict]:
@@ -204,17 +226,24 @@ def _rebuild(dataset: Path, live: list[dict], cache: dict, cfg: Config) -> tuple
             continue
 
         previous_text = row.get("text") or ""
-        previous_asr = row.get("text_cohere") or ""
+        # Datasets built before the column rename keep it as text_cohere.
+        previous_asr = row.get("text_asr") or row.get("text_cohere") or ""
         previous_source = row.get("text_source") or ""
 
+        # Clip-relative speech bounds, so the speaking-rate gate measures the
+        # speech and not the padding around it.
+        offset = float(row.get("start") or 0.0)
         chunk = Chunk(
             index=int(row.get("chunk_index") or 0),
             start=0.0,
             end=float(row.get("duration") or 0.0),
             speaker=row.get("speaker") or "",
+            speech_start=float(row.get("speech_start") or offset) - offset,
+            speech_end=float(row.get("speech_end") or offset) - offset,
         )
         chunk.text_yt = row.get("text_yt") or ""
-        chunk.text_cohere = entry["text"]
+        chunk.text_asr = entry["text"]
+        chunk.text_verify = entry.get("text_verify") or ""
         for key in CARRIED_SCORES:
             if row.get(key) is not None:
                 chunk.scores[key] = row[key]
@@ -228,7 +257,10 @@ def _rebuild(dataset: Path, live: list[dict], cache: dict, cfg: Config) -> tuple
 
         new = dict(row)
         new["text"] = chunk.text
-        new["text_cohere"] = chunk.text_cohere
+        new["text_asr"] = chunk.text_asr
+        new["text_verify"] = chunk.text_verify
+        for legacy in ("text_cohere", "cer_yt_vs_cohere"):
+            new.pop(legacy, None)
         new["text_source"] = chunk.text_source
         new["language"] = chunk.scores.get("asr_language") or row.get("language")
         # asr_confidence_alt goes to None on google: there is no runner-up
@@ -241,15 +273,15 @@ def _rebuild(dataset: Path, live: list[dict], cache: dict, cfg: Config) -> tuple
         statuses[category] = statuses.get(category, 0) + 1
         updated.append(new)
 
-        if clean_for_output(previous_asr) != clean_for_output(chunk.text_cohere):
+        if clean_for_output(previous_asr) != clean_for_output(chunk.text_asr):
             diffs.append(
                 {
                     "audio_file": row["audio_file"],
                     "duration": row.get("duration"),
                     "text_yt": row.get("text_yt"),
                     "asr_before": previous_asr,
-                    "asr_after": chunk.text_cohere,
-                    "cer_before_vs_after": round(cer(previous_asr, chunk.text_cohere), 5) if previous_asr else None,
+                    "asr_after": chunk.text_asr,
+                    "cer_before_vs_after": round(cer(previous_asr, chunk.text_asr), 5) if previous_asr else None,
                     "text_before": previous_text,
                     "text_after": chunk.text,
                     "source_before": previous_source,
@@ -277,7 +309,7 @@ def _write(dataset: Path, backend: str, updated: list[dict], orphans: list[dict]
     if diffs:
         _write_jsonl(dataset / "retranscribe_diff.jsonl", diffs)
 
-    empty = sum(1 for r in updated if not (r.get("text_cohere") or "").strip())
+    empty = sum(1 for r in updated if not (r.get("text_asr") or "").strip())
     changed = len(diffs)
     report = {
         "backend": backend,

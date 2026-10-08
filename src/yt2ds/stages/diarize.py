@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -191,18 +190,21 @@ def single_speaker(duration: float, label: str = "SPEAKER_00") -> Diarization:
 def collapse_if_dominant(diarization: Diarization, cfg: Config) -> Diarization:
     """Merge to a single speaker when one cluster owns nearly all the speech.
 
-    Guards against a diarizer that split one voice across several clusters on a
-    monologue, which would otherwise fragment that voice in the dataset.
+    Opt-in (``diarize.collapse_single_speaker_ratio``). It guards against a
+    diarizer that split one voice across several clusters on a monologue, but
+    it relabels every minority voice too -- a guest with 8% of an episode
+    becomes the host, and their exchanges merge into two-voice clips.
     """
+    ratio = cfg.diarize.collapse_single_speaker_ratio
     totals = diarization.speaker_seconds()
-    if len(totals) < 2:
+    if ratio is None or len(totals) < 2:
         return diarization
     total = sum(totals.values())
     if total <= 0:
         return diarization
 
     dominant, dominant_seconds = max(totals.items(), key=lambda kv: kv[1])
-    if dominant_seconds / total < cfg.diarize.collapse_single_speaker_ratio:
+    if dominant_seconds / total < ratio:
         return diarization
 
     log.info(

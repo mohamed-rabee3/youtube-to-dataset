@@ -2,21 +2,24 @@
 
     scripts/transcribe_gemini.py dataset-socrates --dialect najdi
 
-Why one pass. The two-pass alternative -- Speech-to-Text for the words, then a
-second model for the marks -- pays for the same audio twice and, more to the
-point, pays to repeat its instructions once per clip. Measured on this corpus
-the prompt overhead of a per-clip pass ($46) exceeds the cost of sending every
-second of audio ($28). Batching many clips into one request collapses that
-overhead to about a dollar, and once the batching exists there is no reason to
-run two models: one call can return the transcript already marked.
+This is an optional alternative to the pipeline's own default transcript
+(Cohere-Speech-Tashkeel-2B, which is already diacritized). One call returns
+the transcript already marked.
 
-What is lost, and what replaces it. Without a second independent transcript
-there is nothing to run ``same_words`` against, so a fluent but wrong sentence
-cannot be caught by disagreement. The guards that remain are the audio-side
-gates from the GPU pass, and the text gates in ``yt2ds.stages.filters`` --
-chars-per-second in particular, which catches a transcript grossly too long or
-too short for its audio. That is weaker than a cross-check and is a deliberate
-trade.
+Batching. Each request carries one clip by default (``--max-batch 1``). A
+request holding several clips must decide where each clip's words end, and
+when those clips are neighbours from one episode -- one continuous stretch of
+speech -- that decision goes wrong: words spoken at the end of clip N come back
+as the start of clip N+1, with every index intact, so nothing looks wrong. An
+audit of a dataset built with four neighbouring clips per request found ~13%
+of its labels shifted this way. Raising ``--max-batch`` still saves prompt
+overhead, but clips are then dealt across videos so neighbours never share a
+request (see ``group_requests``).
+
+What guards the result. The text gates in ``yt2ds.stages.filters`` run on
+every row: characters per second, and the CER against the pipeline's own
+``text_verify`` transcript of the same clip, which catches a transcript that
+belongs to some other clip.
 
 Two rules are enforced in code rather than trusted to the model
 (see ``yt2ds.arabic``):
@@ -156,12 +159,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--max-batch",
         type=int,
-        default=4,
-        help="clips per request (default 4). Raising this is NOT free: the model stops "
-        "reliably telling one audio part from another and silently returns clip N's words "
-        "for clip M. Measured on this corpus: 4 clips agreed with an independent transcript "
-        "on 24/24, 12 on 16/23, 60 was unusable. Do not raise it without a reference "
-        "transcript to check alignment against",
+        default=1,
+        help="clips per request (default 1). Above 1 the prompt overhead is shared and the run "
+        "is cheaper, but the model can return one clip's words for another. Clips are then "
+        "never batched with clips of the same video -- where such swaps did the most damage -- "
+        "and the text gates compare every result with the pipeline's own verify transcript",
     )
     p.add_argument("--workers", type=int, default=8, help="requests in flight")
     p.add_argument("--limit", type=int, help="only send the first N clips; for a costed trial")
@@ -222,20 +224,46 @@ def _process(dataset: Path, api_key: str, cfg: Config, args) -> None:
 
 
 def _batches(todo: list[dict], args) -> list[list[dict]]:
-    """Group clips into requests bounded by total audio duration.
+    return group_requests(todo, args.max_batch, args.batch_seconds)
 
-    Byte size, not clip count, is what the inline-audio limit constrains, and
-    clips here vary by 6x in length.
+
+def group_requests(rows: list[dict], max_clips: int, max_seconds: float | None = None) -> list[list[dict]]:
+    """Group clips into requests so that no request holds two clips of one video.
+
+    A multi-clip request asks the model to say where each clip's words end.
+    Consecutive clips of one episode are one continuous stretch of speech, so
+    that boundary is exactly where it goes wrong: a phrase spoken in clip N is
+    returned as the start of clip N+1, with every count and index intact. On
+    one corpus that shifted the text of about 13% of clips. Clips are therefore
+    dealt round-robin across videos, and a clip never joins a request that
+    already holds its video.
     """
+    if max_clips <= 1:
+        return [[row] for row in rows]
+
+    queues: dict[str, list[dict]] = {}
+    for row in rows:
+        queues.setdefault(str(row.get("video_id")), []).append(row)
+    order: list[dict] = []
+    while queues:
+        for video in list(queues):
+            order.append(queues[video].pop(0))
+            if not queues[video]:
+                del queues[video]
+
     out: list[list[dict]] = []
     current: list[dict] = []
+    videos: set[str] = set()
     total = 0.0
-    for row in todo:
+    for row in order:
+        video = str(row.get("video_id"))
         duration = float(row.get("duration") or 0.0)
-        if current and (total + duration > args.batch_seconds or len(current) >= args.max_batch):
+        full = len(current) >= max_clips or (max_seconds is not None and total + duration > max_seconds)
+        if current and (full or video in videos):
             out.append(current)
-            current, total = [], 0.0
+            current, videos, total = [], set(), 0.0
         current.append(row)
+        videos.add(video)
         total += duration
     if current:
         out.append(current)
@@ -386,8 +414,9 @@ def _write(dataset: Path, rows: list[dict], cache: dict, cfg: Config) -> None:
         statuses[entry["status"]] = statuses.get(entry["status"], 0) + 1
         if entry["status"] != "ok":
             continue
+        # The pipeline's own transcripts (text_asr, text_verify) are left as
+        # they are: they are what the gates check this text against.
         row["text"] = entry["text"]
-        row["text_cohere"] = entry["text"]
         row["text_source"] = "gemini" if entry["text"] else "pending"
         row["tashkeel_ratio"] = entry.get("tashkeel_ratio")
 

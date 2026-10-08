@@ -21,7 +21,16 @@ class AudioConfig:
     out_sample_rate: int = 24000
     work_sample_rate: int = 16000
     demucs_sample_rate: int = 44100
+    # Loudness normalization of the written clips. "clip" brings every clip to
+    # target_lufs on its own (consistent level for training); "video" applies
+    # one gain per video (keeps a speaker's loud/quiet contrast).
+    loudness: str = "clip"
     target_lufs: float = -23.0
+    # No sample of a written clip exceeds this. Gain backs off to respect it.
+    peak_ceiling_dbfs: float = -1.0
+    # Raised-cosine fade on both clip edges. Edges sit in silence, so this only
+    # ever shapes room tone -- it is there to stop the cut itself clicking.
+    fade_ms: float = 10.0
     # Off by default: nothing downstream reads the MP3, and at ~27 MB per
     # video an archive of a long run costs more disk than the dataset it
     # accompanies. Turn it on to keep a full-length copy of each source.
@@ -61,15 +70,23 @@ class DownloadConfig:
 class VadConfig:
     threshold: float = 0.5
     min_speech_duration_ms: int = 250
-    min_silence_duration_ms: int = 200
-    speech_pad_ms: int = 100
+    # Fine-grained regions: every pause of this length or more becomes a region
+    # boundary, i.e. a place a clip may legally start or end.
+    min_silence_duration_ms: int = 100
+    # Kept small so regions hug the speech; the clip padding is decided later,
+    # in segment, where the neighbouring speech is known.
+    speech_pad_ms: int = 30
 
 
 @dataclass
 class DiarizeConfig:
     model: str = "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
     drop_overlap: bool = True
-    collapse_single_speaker_ratio: float = 0.9
+    # Off (None) by default. When set, a video where one cluster holds at least
+    # this share of the speech is relabelled as that one speaker -- turning any
+    # minority voice into it. `yt2ds speakers` merges a voice the diarizer split
+    # in two by embedding instead, which cannot swallow a real second speaker.
+    collapse_single_speaker_ratio: float | None = None
     # Segmentation/embedding batch size for the worker. 0 keeps the model
     # config's own (32), which is halved on each retry after an OOM.
     batch_size: int = 0
@@ -78,10 +95,18 @@ class DiarizeConfig:
 @dataclass
 class SegmentConfig:
     min_duration: float = 2.0
-    max_duration: float = 12.0
-    merge_gap: float = 0.3
-    pad: float = 0.2
-    min_split_pause: float = 0.25
+    # Upper bound on the speech inside a clip; the clip itself may add up to
+    # 2 * pad of silence on top.
+    max_duration: float = 20.0
+    # Same-speaker speech separated by at most this much silence stays in one
+    # clip, so sentences are not chopped at every breath.
+    merge_gap: float = 0.8
+    # Most silence kept on each side of a clip. Never more than half the gap to
+    # the neighbouring speech, so clips never share audio.
+    pad: float = 0.25
+    # Shortest silence a clip may start, end or be split in. Anything shorter is
+    # inside a phrase, and a cut there clips words.
+    min_cut_pause: float = 0.15
 
 
 @dataclass
@@ -135,10 +160,19 @@ class MusicConfig:
 
 @dataclass
 class SpeakersConfig:
-    embed_model: str = "speechbrain/spkrec-ecapa-voxceleb"
-    max_centroid_distance: float = 0.45
-    link_threshold: float = 0.35
+    # WeSpeaker ResNet293 (default) or a speechbrain/ ECAPA model. The distance
+    # thresholds below are calibrated for ResNet293; ECAPA's are 0.45 / 0.35.
+    embed_model: str = "Wespeaker/wespeaker-voxceleb-resnet293-LM"
+    # Cosine distance from a clip to its own per-video speaker centroid above
+    # which the clip is dropped as probably not that speaker.
+    max_centroid_distance: float = 0.35
+    # Per-video speakers closer than this (average linkage) are one voice.
+    link_threshold: float = 0.40
+    # A global speaker pooling less audio than this is diarization debris.
     min_speaker_seconds: float = 30.0
+    # `yt2ds speakers`: a clip further than this from its global speaker's
+    # centroid is not filed under that speaker.
+    max_clip_distance: float = 0.45
 
 
 @dataclass
@@ -217,19 +251,24 @@ class GoogleBatchConfig:
 
 @dataclass
 class AsrConfig:
-    # "google" (per-chunk Cloud Speech-to-Text v1), "google_batch" (whole-episode
-    # V2 BatchRecognize, filled in by `yt2ds transcribe`), or "cohere" (local 2B
-    # GPU model).
-    backend: str = "google"
-    # Decoded once per language; highest-confidence result wins. See
-    # configs/default.yaml for why this is not auto-detected.
-    languages: list[str] = field(default_factory=lambda: ["ar", "en"])
+    # "cohere" (local GPU model, default), "google" (per-chunk Cloud
+    # Speech-to-Text v1) or "google_batch" (whole-episode V2 BatchRecognize,
+    # filled in by `yt2ds transcribe`).
+    backend: str = "cohere"
+    # Decoded once per language; highest-confidence result wins. The tashkeel
+    # model is trained for Arabic only, so it decodes "ar" alone.
+    languages: list[str] = field(default_factory=lambda: ["ar"])
     google: GoogleAsrConfig = field(default_factory=GoogleAsrConfig)
     google_batch: GoogleBatchConfig = field(default_factory=GoogleBatchConfig)
     # -- cohere backend only --
-    model: str = "CohereLabs/cohere-transcribe-arabic-07-2026"
-    batch_size: int = 8
-    max_new_tokens: int = 256
+    # Fully diacritized Arabic straight from the audio, one clip at a time.
+    model: str = "NAMAA-Space/Cohere-Speech-Tashkeel-2B"
+    # A second, independent transcription of every clip. The canonical text is
+    # rejected when its skeleton disagrees with this one by more than
+    # filters.max_cer_verify. Empty disables the check.
+    verify_model: str = "CohereLabs/cohere-transcribe-arabic-07-2026"
+    batch_size: int = 16
+    max_new_tokens: int = 448
     dtype: str = "bfloat16"
 
 
@@ -255,7 +294,15 @@ class QualityConfig:
 
 @dataclass
 class FiltersConfig:
-    max_cer_yt_vs_cohere: float = 0.35
+    # Subtitle text is kept only if it agrees with the ASR transcript this well.
+    max_cer_yt_vs_asr: float = 0.35
+    # The ASR transcript is kept only if the verify model agrees this well
+    # (CER on undiacritized text). Calibrated on Saudi podcast speech, where it
+    # rejects ~2% of clips -- almost all of them genuinely mis-transcribed.
+    max_cer_verify: float = 0.35
+    # When subtitles and the ASR transcript agree, keep the ASR text (it is
+    # diacritized and correctly spelled; subtitles are neither).
+    prefer_asr_text: bool = True
     # Arabic script is compact; measured speech runs ~5-13 chars/sec.
     min_chars_per_sec: float = 4.0
     max_chars_per_sec: float = 18.0
@@ -267,7 +314,9 @@ class FiltersConfig:
     # where there is no second transcript to compare against. The two backends
     # report on different scales and so get separate floors: Cohere's is a mean
     # per-token log-probability (<= 0), Google's is its own 0-1 confidence.
-    min_asr_confidence: float = -1.0
+    # -0.10 is calibrated for the tashkeel model, whose median is about -0.03;
+    # every clip measured below it was a garbled transcript.
+    min_asr_confidence: float = -0.10
     min_asr_confidence_google: float = 0.5
     drop_boundary_clipped_words: bool = True
 

@@ -1,8 +1,17 @@
-"""Transcribe chunks with Cohere Transcribe Arabic (``asr.backend: cohere``).
+"""Transcribe chunks with a Cohere ASR model (``asr.backend: cohere``).
 
-The local GPU alternative to the default Google backend: no API key, no
-per-minute billing and no network, at the cost of a 2B model resident on the
-card and roughly real-time decoding.
+The default backend. Two models of the same architecture run here:
+
+* ``asr.model`` -- by default NAMAA-Space/Cohere-Speech-Tashkeel-2B, which
+  writes fully diacritized Arabic straight from the audio, so the dataset's
+  vowels come from what was said rather than from a text diacritizer guessing.
+* ``asr.verify_model`` -- by default Cohere Transcribe Arabic, an independent
+  second transcription. ``filters`` compares the two skeletons and drops clips
+  where they disagree, which is the guard a subtitle-less video otherwise
+  lacks.
+
+No API key, no per-minute billing and no network, at the cost of 2B models
+resident on the card.
 
 The model emits no timestamps, which is precisely why the pipeline segments
 first and transcribes second: each chunk is already a 2-12 second clip, so the
@@ -63,17 +72,9 @@ def transcribe_batch(
     languages = cfg.asr.languages or ["ar"]
 
     # candidates[language] -> (texts, confidences) aligned with `audio`
-    candidates: dict[str, tuple[list[str], list[float | None]]] = {}
-    step = max(1, cfg.asr.batch_size)
-    for language in languages:
-        texts: list[str] = []
-        confidences: list[float | None] = []
-        for start in range(0, len(audio), step):
-            window = audio[start : start + step]
-            window_texts, window_scores = _transcribe(window, language, processor, model, cfg, registry)
-            texts.extend(window_texts)
-            confidences.extend(window_scores)
-        candidates[language] = (texts, confidences)
+    candidates = {
+        language: _decode_all(audio, language, processor, model, cfg, registry) for language in languages
+    }
 
     results: list[str] = []
     for index, (chunk, _) in enumerate(items):
@@ -90,6 +91,55 @@ def transcribe_batch(
             chunk.scores["asr_confidence_alt"] = others
         results.append(best_text)
     return results
+
+
+@torch.inference_mode()
+def verify_batch(
+    items: list[tuple[Chunk, np.ndarray]],
+    sr: int,
+    cfg: Config,
+    registry: ModelRegistry,
+) -> list[str]:
+    """Second, independent transcription with ``asr.verify_model``.
+
+    Decoded under the language the primary transcript was chosen in, so the
+    two are comparable. Writes ``verify_confidence`` into each chunk's scores.
+    """
+    if not items:
+        return []
+    processor, model = registry.asr_verify
+    audio = [resample(samples, sr, _ASR_SR) for _, samples in items]
+    by_language: dict[str, list[int]] = {}
+    for index, (chunk, _) in enumerate(items):
+        language = chunk.scores.get("asr_language") or (cfg.asr.languages or ["ar"])[0]
+        by_language.setdefault(language, []).append(index)
+
+    texts = [""] * len(items)
+    for language, indices in by_language.items():
+        decoded, scores = _decode_all([audio[i] for i in indices], language, processor, model, cfg, registry)
+        for i, text, score in zip(indices, decoded, scores):
+            texts[i] = text
+            items[i][0].scores["verify_confidence"] = score
+    return texts
+
+
+def _decode_all(
+    audio: list[np.ndarray],
+    language: str,
+    processor,
+    model,
+    cfg: Config,
+    registry: ModelRegistry,
+) -> tuple[list[str], list[float | None]]:
+    """Decode every clip under one language prompt, ``asr.batch_size`` at a time."""
+    texts: list[str] = []
+    confidences: list[float | None] = []
+    step = max(1, cfg.asr.batch_size)
+    for start in range(0, len(audio), step):
+        window_texts, window_scores = _transcribe(audio[start : start + step], language, processor, model, cfg, registry)
+        texts.extend(window_texts)
+        confidences.extend(window_scores)
+    return texts, confidences
 
 
 def _pick(
@@ -142,6 +192,10 @@ def _transcribe(
         return_tensors="pt",
         language=language,
     )
+    # Audio longer than the model's window (35 s) comes back as several rows.
+    # This maps every row to the clip it came from; without it, one long clip
+    # would shift every later transcript onto the wrong clip.
+    row_owner = _row_owners(inputs.pop("audio_chunk_index", None), len(usable))
     # The feature extractor always returns float32 log-mels. The model runs in
     # bf16, and the encoder's first conv rejects a dtype mismatch outright, so
     # cast the float tensors while leaving the integer ones (decoder_input_ids,
@@ -171,16 +225,31 @@ def _transcribe(
             scores[i] = single_score[0]
         return texts, scores
 
-    sequences = outputs.sequences
-    decoded = processor.batch_decode(sequences, skip_special_tokens=True)
+    decoded = processor.batch_decode(outputs.sequences, skip_special_tokens=True)
     confidences = _confidence(model, outputs, processor)
+
+    # Rows arrive in clip order, and within a clip in time order.
+    pieces: dict[int, list[str]] = {}
+    row_scores: dict[int, list[float]] = {}
+    for row, owner in enumerate(row_owner):
+        pieces.setdefault(owner, []).append(decoded[row].strip())
+        if confidences[row] is not None:
+            row_scores.setdefault(owner, []).append(confidences[row])
 
     texts = [""] * len(audio)
     scores = [None] * len(audio)
     for position, i in enumerate(usable):
-        texts[i] = clean_for_output(decoded[position])
-        scores[i] = confidences[position]
+        texts[i] = clean_for_output(" ".join(p for p in pieces.get(position, []) if p))
+        kept = row_scores.get(position)
+        scores[i] = round(sum(kept) / len(kept), 5) if kept else None
     return texts, scores
+
+
+def _row_owners(chunk_index, count: int) -> list[int]:
+    """Which input clip each feature row belongs to."""
+    if chunk_index is None:
+        return list(range(count))
+    return [int(entry[0]) if isinstance(entry, (tuple, list)) else int(entry) for entry in chunk_index]
 
 
 def _confidence(model, outputs, processor) -> list[float | None]:

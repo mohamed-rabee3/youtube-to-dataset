@@ -5,14 +5,14 @@ matters for voice cloning is whether *this clip* contains *that voice*. A
 diarizer with an excellent DER can still hand one chunk to the wrong cluster,
 and a single contaminated clip is worse than a missing one.
 
-So every surviving chunk is embedded with ECAPA-TDNN, a centroid is built per
-diarization speaker, and chunks far from their own centroid are dropped. The
+So every surviving chunk is embedded (WeSpeaker ResNet293 by default, see
+:mod:`yt2ds.embedders`), a centroid is built per diarization speaker, and chunks far from their own centroid are dropped. The
 centroid is computed from the closest-to-median chunks rather than all of them,
 so a handful of mislabelled clips cannot drag it toward themselves.
 
-The same embeddings then let ``yt2ds report --link-speakers`` merge identities
-across videos, so a podcast host appearing in forty episodes becomes one voice
-with pooled hours rather than forty separate ones.
+The same embeddings then let ``yt2ds speakers`` merge identities across
+videos, so a podcast host appearing in forty episodes becomes one voice with
+pooled hours rather than forty separate ones.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-import torch
 
 from ..config import Config
 from ..models import ModelRegistry
@@ -30,35 +29,31 @@ from .segment import Chunk
 log = logging.getLogger(__name__)
 
 _EMBED_SR = 16000
-# Below this, ECAPA has too little signal for a stable embedding.
+# Below this there is too little signal for a stable embedding.
 _MIN_SECONDS = 0.8
 
 
-@torch.inference_mode()
 def embed_batch(
     items: list[tuple[Chunk, np.ndarray]],
     sr: int,
     cfg: Config,
     registry: ModelRegistry,
 ) -> np.ndarray:
-    """Return L2-normalized embeddings, one row per chunk."""
-    if not items:
-        return np.zeros((0, 192), dtype=np.float32)
+    """Return L2-normalized embeddings, one row per chunk.
 
+    Chunks too short to embed get a zero row, which every consumer treats as
+    "no embedding".
+    """
     encoder = registry.speaker_encoder
-    rows: list[np.ndarray] = []
-    for _, samples in items:
-        audio = resample(samples, sr, _EMBED_SR)
-        if audio.size < int(_MIN_SECONDS * _EMBED_SR):
-            rows.append(None)  # type: ignore[arg-type]
-            continue
-        wav = torch.from_numpy(audio).unsqueeze(0).to(registry.device)
-        emb = encoder.encode_batch(wav).squeeze(0).squeeze(0).float().cpu().numpy()
-        norm = np.linalg.norm(emb)
-        rows.append(emb / norm if norm > 0 else emb)
+    if not items:
+        return np.zeros((0, encoder.dim), dtype=np.float32)
 
-    dim = next((r.shape[0] for r in rows if r is not None), 192)
-    return np.stack([r if r is not None else np.zeros(dim, dtype=np.float32) for r in rows]).astype(np.float32)
+    audio = [resample(samples, sr, _EMBED_SR) for _, samples in items]
+    usable = [i for i, a in enumerate(audio) if a.size >= int(_MIN_SECONDS * _EMBED_SR)]
+    out = np.zeros((len(items), encoder.dim), dtype=np.float32)
+    if usable:
+        out[usable] = encoder.embed([audio[i] for i in usable])
+    return out
 
 
 def verify_purity(
@@ -82,7 +77,7 @@ def verify_purity(
 
     for speaker, indices in by_speaker.items():
         vectors = embeddings[indices]
-        centroid = _robust_centroid(vectors)
+        centroid = robust_centroid(vectors)
         centroids[speaker] = centroid
 
         distances = 1.0 - vectors @ centroid
@@ -99,7 +94,7 @@ def verify_purity(
     return centroids
 
 
-def _robust_centroid(vectors: np.ndarray) -> np.ndarray:
+def robust_centroid(vectors: np.ndarray) -> np.ndarray:
     """Mean of the half of the vectors closest to the provisional mean.
 
     Trimming before averaging keeps a few contaminated clips from pulling the

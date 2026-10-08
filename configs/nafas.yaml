@@ -9,9 +9,17 @@ audio:
   # Working copies. 16k feeds VAD/ASR/aligner/diarizer, 44.1k feeds Demucs.
   work_sample_rate: 16000
   demucs_sample_rate: 44100
-  # Per-video EBU R128 loudness target. Applied per video, not per chunk, so
-  # relative dynamics between chunks survive.
+  # Loudness of the written clips (EBU R128). "clip" normalizes every clip to
+  # target_lufs on its own, so the dataset trains at one level; "video" applies
+  # one gain per video and keeps a speaker's loud/quiet contrast between clips.
+  loudness: clip
   target_lufs: -23.0
+  # No sample of a written clip exceeds this; the gain backs off to respect
+  # it, so nothing is ever hard-clipped on write.
+  peak_ceiling_dbfs: -1.0
+  # Fade on both clip edges. Edges sit in silence, so this only shapes room
+  # tone -- it stops the cut itself from clicking.
+  fade_ms: 10.0
   # Write and keep an archival mp3 of the full audio. Off by default: nothing
   # downstream reads it, and at ~27 MB per video it outgrows the dataset.
   keep_mp3: false
@@ -43,15 +51,22 @@ download:
 vad:
   threshold: 0.5
   min_speech_duration_ms: 250
-  min_silence_duration_ms: 200
-  speech_pad_ms: 100
+  # Every pause at least this long becomes a region boundary -- a place a clip
+  # may legally start or end. Fine-grained on purpose.
+  min_silence_duration_ms: 100
+  # Small, so regions hug the speech. How much silence a clip keeps is decided
+  # in `segment`, where the neighbouring speech is known.
+  speech_pad_ms: 30
 
 diarize:
   model: "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
   # Chunks overlapping two speakers are poison for voice cloning.
   drop_overlap: true
-  # Guard against a diarizer that split one voice into many clusters.
-  collapse_single_speaker_ratio: 0.9
+  # Off. When set (e.g. 0.9), a video where one cluster holds that share of
+  # the speech is relabelled as a single speaker -- which also turns a short
+  # guest into the host. A voice the diarizer split in two is merged later, by
+  # embedding, in `yt2ds speakers`.
+  collapse_single_speaker_ratio: null
   # Pinned to 4 for this corpus. Left at 0 the diarizer OOMs on this card at
   # 32, 16 and 8 in turn before landing here, and each retry costs about a
   # minute -- over 101 episodes that is an hour and a half of nothing.
@@ -59,14 +74,19 @@ diarize:
 
 segment:
   min_duration: 2.0
-  max_duration: 12.0
-  # Same-speaker VAD regions closer than this are merged into one chunk.
-  merge_gap: 0.3
-  # Silence padding kept on each side of a chunk.
-  pad: 0.2
-  # A chunk longer than max_duration is split at its deepest internal pause,
-  # provided the pause is at least this long.
-  min_split_pause: 0.25
+  # Upper bound on the speech inside a clip; padding may add up to 2 * pad.
+  max_duration: 20.0
+  # Same-speaker speech separated by at most this much silence stays in one
+  # clip, so a sentence is not chopped at every breath.
+  merge_gap: 0.8
+  # Most silence kept on each side of a clip -- and never more than half the
+  # gap to the neighbouring speech, so no two clips share audio.
+  pad: 0.25
+  # Shortest silence a clip may start, end or be split in. Clip edges that
+  # land mid-phrase (a turn change, overlapped speech) are pulled back to the
+  # nearest pause at least this long; a long stretch with no such pause is
+  # dropped, never cut on a grid.
+  min_cut_pause: 0.15
 
 separate:
   # Pull the music bed out of the speech, over the whole video, before
@@ -113,29 +133,37 @@ music:
     - "Piano"
 
 speakers:
-  embed_model: "speechbrain/spkrec-ecapa-voxceleb"
-  # Cosine distance from a chunk to its own speaker centroid. Above this the
-  # chunk probably is not that speaker.
-  max_centroid_distance: 0.45
-  # Cross-video speaker linking (yt2ds report --link-speakers).
-  link_threshold: 0.35
+  # WeSpeaker ResNet293. On Saudi podcast audio it cut host-vs-guest EER from
+  # 2.72% (ECAPA) to 1.58%. "speechbrain/spkrec-ecapa-voxceleb" still works;
+  # use 0.45 / 0.35 for the two distances below if you switch to it.
+  embed_model: "Wespeaker/wespeaker-voxceleb-resnet293-LM"
+  # Cosine distance from a clip to its own per-video speaker centroid. Above
+  # this the clip probably is not that speaker and is dropped.
+  max_centroid_distance: 0.35
+  # Cross-video linking (`yt2ds speakers`): per-video speakers closer than this
+  # (average linkage) are one voice.
+  link_threshold: 0.40
+  # A linked voice pooling less audio than this is diarization debris.
   min_speaker_seconds: 30.0
+  # `yt2ds speakers`: a clip further than this from its voice's centroid is
+  # filed under _unassigned instead.
+  max_clip_distance: 0.45
 
 asr:
-  # "google" -- Cloud Speech-to-Text. The default: no GPU, no 2B model
-  #             resident, and stronger on Saudi/Gulf dialect than a general
-  #             model. Needs credentials and is billed per audio minute.
-  # "cohere"  -- Cohere Transcribe Arabic, run locally on the GPU. No API key,
-  #             no network, no per-minute cost. `--asr-backend cohere`.
-  backend: "google"
+  # "cohere"       -- the default. Local GPU models, no API key, no per-minute
+  #                   cost; `model` below transcribes and `verify_model`
+  #                   cross-checks every clip.
+  # "google"       -- Cloud Speech-to-Text v1, one request per clip. Needs
+  #                   credentials and is billed per audio minute.
+  # "google_batch" -- whole-episode V2 BatchRecognize, filled in afterwards by
+  #                   `yt2ds transcribe`.
+  backend: "cohere"
   # On google: the first entry is the primary language and the rest are sent
-  # as alternatives the API detects among, so a chunk costs one request either
-  # way. On cohere there is no auto-detect -- the model decodes under a
-  # language prompt, so each chunk is decoded once per language here and the
-  # higher-confidence result wins, which is what stops English segments being
-  # forced into invented Arabic. Either way, set to ["ar"] alone for
-  # Arabic-only material; on cohere that halves ASR time.
-  languages: ["ar", "en"]
+  # as alternatives the API detects among. On cohere there is no auto-detect:
+  # each clip is decoded once per language and the higher-confidence result
+  # wins. The tashkeel model is trained for Arabic only, so "ar" alone; add
+  # "en" when using a model that also writes English.
+  languages: ["ar"]
 
   google:
     # Google's general long-form model. "latest_short", "chirp_2" and the rest
@@ -193,9 +221,16 @@ asr:
     timeout: 14400.0
 
   # -- cohere backend only --
-  model: "CohereLabs/cohere-transcribe-arabic-07-2026"
-  batch_size: 8
-  max_new_tokens: 256
+  # Fully diacritized Arabic from the audio in one pass (case endings as
+  # pronounced), each clip decoded on its own -- no clip can take another's
+  # words.
+  model: "NAMAA-Space/Cohere-Speech-Tashkeel-2B"
+  # An independent second transcription of every clip. The canonical text is
+  # dropped when its undiacritized skeleton disagrees with this one by more
+  # than filters.max_cer_verify. "" disables the check.
+  verify_model: "CohereLabs/cohere-transcribe-arabic-07-2026"
+  batch_size: 16
+  max_new_tokens: 448
   dtype: "bfloat16"
 
 align:
@@ -221,10 +256,15 @@ quality:
 filters:
   # The fidelity gate: character error rate between the YouTube subtitle text
   # and the ASR backend's transcription of the same chunk. Above this they
-  # disagree too much to trust either, so the chunk is dropped. (The key name
-  # predates the Google backend; datasets built before it keep the same
-  # column.)
-  max_cer_yt_vs_cohere: 0.35
+  # disagree too much to trust either, so the chunk is dropped.
+  max_cer_yt_vs_asr: 0.35
+  # Same idea without subtitles: CER between the canonical transcript and the
+  # verify model's, on undiacritized text. Clips with English or digits in the
+  # verify transcript are not gated (the two models write those differently).
+  max_cer_verify: 0.35
+  # When subtitles and ASR agree, keep the ASR text as canonical: it carries
+  # diacritics and real orthography, YouTube's captions carry neither.
+  prefer_asr_text: true
   # Calibrated for Arabic script, which is far more compact than Latin:
   # measured Saudi podcast speech runs 5.4-12.8 chars/sec, median 9.5.
   # These bounds catch gross timing failures (text bled in from a neighbouring
@@ -242,7 +282,9 @@ filters:
   # get separate floors: cohere reports a mean per-token log-probability
   # (<= 0), google its own 0-1 confidence. Whichever produced the text picks
   # the floor.
-  min_asr_confidence: -1.0
+  # -0.10 is calibrated for the tashkeel model (median about -0.03); every
+  # clip measured below it was a garbled transcript.
+  min_asr_confidence: -0.10
   min_asr_confidence_google: 0.5
   # A word whose forced-aligned span is cut by the chunk boundary means the
   # transcript does not match the audio in the clip.

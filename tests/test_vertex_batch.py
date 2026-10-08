@@ -113,3 +113,41 @@ class TestPredictionEntries:
     def test_prompt_only_part_is_not_mistaken_for_a_clip(self):
         entries = _prediction_entries(_record(CLIPS, ["أ", "ب"]), PREFIX)
         assert len(entries) == 2  # not 3, despite the trailing text part
+
+
+class TestRequestGrouping:
+    """Neighbouring clips of one episode must never share a request."""
+
+    @staticmethod
+    def rows(videos: int, per_video: int) -> list[dict]:
+        return [
+            {"audio_file": f"v{v}_{i:04d}.wav", "video_id": f"v{v}", "duration": 4.0}
+            for v in range(videos)
+            for i in range(per_video)
+        ]
+
+    def test_default_is_one_clip_per_request(self):
+        from transcribe_gemini import group_requests
+
+        assert all(len(r) == 1 for r in group_requests(self.rows(3, 5), 1))
+
+    def test_no_request_holds_two_clips_of_one_video(self):
+        from transcribe_gemini import group_requests
+
+        rows = self.rows(5, 7)
+        requests = group_requests(rows, 4)
+        assert sorted(r["audio_file"] for req in requests for r in req) == sorted(r["audio_file"] for r in rows)
+        for request in requests:
+            assert len({r["video_id"] for r in request}) == len(request)
+            assert len(request) <= 4
+
+    def test_a_single_video_falls_back_to_one_clip_per_request(self):
+        from transcribe_gemini import group_requests
+
+        assert all(len(r) == 1 for r in group_requests(self.rows(1, 6), 4))
+
+    def test_duration_budget_is_respected(self):
+        from transcribe_gemini import group_requests
+
+        for request in group_requests(self.rows(6, 3), 4, max_seconds=10.0):
+            assert sum(r["duration"] for r in request) <= 10.0

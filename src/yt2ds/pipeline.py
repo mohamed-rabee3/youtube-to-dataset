@@ -32,13 +32,28 @@ import numpy as np
 from .config import Config
 from .io import JsonlWriter, Workspace, drop_video_records, write_json
 from .models import ModelRegistry
-from .stages import align, asr, audio, diarize, download, filters, music, quality, segment, separate, speakers, subtitles, vad
+from .stages import (
+    align,
+    asr,
+    asr_cohere,
+    audio,
+    diarize,
+    download,
+    filters,
+    music,
+    quality,
+    segment,
+    separate,
+    speakers,
+    subtitles,
+    vad,
+)
 from .stages.segment import Chunk
 
 log = logging.getLogger(__name__)
 
-# How many chunks are held in memory at once.
-BATCH = 8
+# How many chunks are held in memory at once, and the largest ASR batch.
+BATCH = 16
 
 
 @dataclass
@@ -287,15 +302,12 @@ class Pipeline:
         """Run the GPU detectors over every chunk, batch by batch."""
         sr = prepared.master_sr
         embeddings: list[np.ndarray] = []
-        reference: np.ndarray | None = None
 
         for batch in _batched(chunks, BATCH):
             items = [(c, audio.read_segment(prepared.master_path, sr, c.start, c.end)) for c in batch]
 
             music.score_batch(items, sr, self.cfg, self.registry)
-            quality.score_batch(items, sr, self.cfg, self.registry, reference=reference)
-            if reference is None:
-                reference = quality.pick_reference(items, sr)
+            quality.score_batch(items, sr, self.cfg, self.registry)
 
             embeddings.append(speakers.embed_batch(items, sr, self.cfg, self.registry))
 
@@ -306,32 +318,43 @@ class Pipeline:
             if alive and not self.defers_asr:
                 texts = asr.transcribe_batch(alive, sr, self.cfg, self.registry)
                 for (chunk, _), text in zip(alive, texts):
-                    chunk.text_cohere = text
+                    chunk.text_asr = text
+                self._verify(alive, sr)
 
-        # The SQUIM MOS reference is only available once the first batch has
-        # been scored, so that batch comes back unscored. Backfill it now.
-        self._backfill_mos(chunks, prepared, reference)
+        self._score_mos(chunks, prepared)
 
         if embeddings:
             matrix = np.concatenate(embeddings, axis=0)
             centroids = speakers.verify_purity(chunks, matrix, self.cfg)
-            self._save_centroids(video_id, centroids)
+            self._save_embeddings(video_id, chunks, matrix, centroids)
 
-    def _backfill_mos(
-        self,
-        chunks: list[Chunk],
-        prepared: audio.PreparedAudio,
-        reference: np.ndarray | None,
-    ) -> None:
-        if reference is None:
+    def _verify(self, items: list[tuple[Chunk, np.ndarray]], sr: int) -> None:
+        """Transcribe each clip a second time with the independent verify model.
+
+        Only the local Cohere backend has one; ``filters`` compares the two.
+        """
+        if (self.cfg.asr.backend or "").lower() != "cohere" or not self.cfg.asr.verify_model:
             return
-        missing = [c for c in chunks if c.reject_reason is None and c.scores.get("squim_mos") is None]
-        if not missing:
+        texted = [(c, a) for c, a in items if c.text_asr]
+        for (chunk, _), text in zip(texted, asr_cohere.verify_batch(texted, sr, self.cfg, self.registry)):
+            chunk.text_verify = text
+
+    def _score_mos(self, chunks: list[Chunk], prepared: audio.PreparedAudio) -> None:
+        """SQUIM MOS for every live chunk, against the episode's cleanest clip.
+
+        SQUIM's MOS needs a clean reference. Choosing it only once every chunk
+        has its objective scores means each episode is judged against its best
+        clip, not against whichever happened to be in the first batch.
+        """
+        alive = [c for c in chunks if c.reject_reason is None]
+        best = max(alive, key=lambda c: c.scores.get("squim_stoi") or -1.0, default=None)
+        if best is None or best.scores.get("squim_stoi") is None:
             return
         sr = prepared.master_sr
-        for batch in _batched(missing, BATCH):
+        reference = quality.prepare_reference(audio.read_segment(prepared.master_path, sr, best.start, best.end), sr)
+        for batch in _batched(alive, BATCH):
             items = [(c, audio.read_segment(prepared.master_path, sr, c.start, c.end)) for c in batch]
-            quality.score_batch(items, sr, self.cfg, self.registry, reference=reference)
+            quality.score_mos(items, sr, self.registry, reference)
 
     def _export_for_batch(self, prepared: audio.PreparedAudio, video_id: str) -> None:
         """Stage this episode's audio for the later batch transcription pass.
@@ -352,15 +375,29 @@ class Pipeline:
             return
         log.info("%s: staged %.0f MB for batch transcription", video_id, target.stat().st_size / 1e6)
 
-    def _save_centroids(self, video_id: str, centroids: dict[str, np.ndarray]) -> None:
-        """Persist per-speaker centroids for `report --link-speakers`.
+    def _save_embeddings(
+        self,
+        video_id: str,
+        chunks: list[Chunk],
+        matrix: np.ndarray,
+        centroids: dict[str, np.ndarray],
+    ) -> None:
+        """Persist what `yt2ds speakers` needs to link voices across videos.
 
-        Keys are the already-namespaced speaker labels, so centroids from
-        different videos never collide when they are pooled for clustering.
+        ``<video>.npz`` holds one centroid per speaker, keyed by the namespaced
+        label so centroids from different videos never collide when pooled.
+        ``<video>.clips.npz`` holds every kept clip's own embedding, so each
+        clip can be checked against the voice it is finally filed under.
         """
-        if not centroids:
-            return
-        np.savez(self.ws.embeddings / f"{video_id}.npz", **centroids)
+        if centroids:
+            np.savez(self.ws.embeddings / f"{video_id}.npz", **centroids)
+        kept = [i for i, c in enumerate(chunks) if c.reject_reason is None and np.any(matrix[i])]
+        if kept:
+            np.savez(
+                self.ws.embeddings / f"{video_id}.clips.npz",
+                index=np.array([chunks[i].index for i in kept], dtype=np.int32),
+                embedding=matrix[kept].astype(np.float32),
+            )
 
     # ------------------------------------------------------------------
     def _emit(
@@ -370,7 +407,6 @@ class Pipeline:
         prepared: audio.PreparedAudio,
         result: VideoResult,
     ) -> None:
-        out_sr = self.cfg.audio.out_sample_rate
         # The MP3 is the untouched mix, so cutting from it would undo the
         # separation. The isolated master wins whenever both are asked for.
         from_mp3 = self.cfg.audio.chunk_from_mp3 and prepared.mp3_path is not None and not prepared.separated
@@ -383,21 +419,30 @@ class Pipeline:
         rejected_records: list[dict[str, Any]] = []
 
         for chunk in chunks:
-            record = self._record(chunk, assets, prepared, out_sr)
+            record = self._record(chunk, assets, prepared)
             if chunk.reject_reason is not None:
                 record["reject_reason"] = chunk.reject_reason
                 rejected_records.append(record)
                 continue
 
-            samples = audio.read_segment(source, source_sr, chunk.start, chunk.end)
-            samples = audio.apply_gain(samples, prepared.gain_db)
-            samples = audio.resample(samples, source_sr, out_sr)
-            if samples.size == 0:
+            clip = audio.render_clip(
+                audio.read_segment(source, source_sr, chunk.start, chunk.end),
+                source_sr,
+                self.cfg.audio,
+                prepared.gain_db,
+            )
+            if clip.samples.size == 0:
                 record["reject_reason"] = "audio:empty"
                 rejected_records.append(record)
                 continue
+            record.update(
+                gain_db=clip.gain_db,
+                gain_limited_db=clip.gain_limited_db,
+                lufs=clip.lufs,
+                out_peak_dbfs=clip.peak_dbfs,
+            )
 
-            audio.write_wav(self.ws.wavs / record["audio_file"], samples, out_sr)
+            audio.write_wav(self.ws.wavs / record["audio_file"], clip.samples, self.cfg.audio.out_sample_rate)
             kept_records.append(record)
             result.seconds_kept += chunk.duration
             result.speakers[chunk.speaker] = result.speakers.get(chunk.speaker, 0.0) + chunk.duration
@@ -416,7 +461,6 @@ class Pipeline:
         chunk: Chunk,
         assets: download.VideoAssets,
         prepared: audio.PreparedAudio,
-        out_sr: int,
     ) -> dict[str, Any]:
         s = chunk.scores
         return {
@@ -434,19 +478,29 @@ class Pipeline:
             "start": round(chunk.start, 3),
             "end": round(chunk.end, 3),
             "duration": round(chunk.duration, 3),
+            # Where the speech sits inside the clip; the rest is padding taken
+            # from the surrounding silence.
+            "speech_start": round(chunk.speech_start, 3),
+            "speech_end": round(chunk.speech_end, 3),
+            "voiced_seconds": s.get("voiced_seconds"),
+            "max_internal_pause": s.get("max_internal_pause"),
             "speaker": chunk.speaker,
             "global_speaker": None,
             "speaker_conf": s.get("speaker_conf"),
+            "speaker_distance": s.get("speaker_distance"),
             "text": chunk.text,
             # "pending" marks a row the GPU pass emitted without text, for
             # `yt2ds transcribe` to fill in. It is not a text_source anyone
             # reads as provenance -- that is overwritten when the words land.
             "text_source": "pending" if self.defers_asr else chunk.text_source,
             "text_yt": chunk.text_yt,
-            "text_cohere": chunk.text_cohere,
-            "cer_yt_vs_cohere": s.get("cer_yt_vs_cohere"),
+            "text_asr": chunk.text_asr,
+            "cer_yt_vs_asr": s.get("cer_yt_vs_asr"),
+            "text_verify": chunk.text_verify,
+            "cer_verify": s.get("cer_verify"),
             "asr_language": s.get("asr_language"),
             "asr_confidence": s.get("asr_confidence"),
+            "verify_confidence": s.get("verify_confidence"),
             "asr_confidence_alt": s.get("asr_confidence_alt"),
             "align_score": s.get("align_score"),
             "aligned_words": s.get("aligned_words"),
@@ -464,14 +518,18 @@ class Pipeline:
             "squim_pesq": s.get("squim_pesq"),
             "squim_si_sdr": s.get("squim_si_sdr"),
             "snr_db": s.get("snr_db"),
+            # Signal statistics of the source cut, before any gain.
             "peak_dbfs": s.get("peak_dbfs"),
             "rms_dbfs": s.get("rms_dbfs"),
             "clipping_ratio": s.get("clipping_ratio"),
             "arabic_ratio": s.get("arabic_ratio"),
             "script_ratio": s.get("script_ratio"),
             "chars_per_sec": s.get("chars_per_sec"),
-            "lufs": round(prepared.lufs, 3) if prepared.lufs == prepared.lufs else None,
-            "sample_rate": out_sr,
+            # Integrated loudness of the whole source episode (after isolation).
+            # The written clip's own loudness is `lufs`, filled in on write.
+            "source_lufs": round(prepared.lufs, 3) if prepared.lufs == prepared.lufs else None,
+            "lufs": None,
+            "sample_rate": self.cfg.audio.out_sample_rate,
             # The language the transcript is actually in, not an assumption.
             "language": s.get("asr_language") or "ar",
         }

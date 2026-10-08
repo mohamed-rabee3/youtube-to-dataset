@@ -50,3 +50,7 @@ dataset-nafas/
 nafas/
 
 socrates/
+
+# Run output and local media.
+nohup.out
+*.mp3

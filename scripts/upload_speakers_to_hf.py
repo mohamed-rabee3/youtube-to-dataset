@@ -37,76 +37,20 @@ import argparse
 import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import soundfile as sf
-from datasets import Audio, Features, Value
 from huggingface_hub import CommitOperationAdd, HfApi
 
-# Every column yt2ds writes, typed explicitly. Inferring the schema from the
-# rows does not work: the fields that come from alignment are null on videos
-# that skipped it, and a shard where a column is null throughout would type
-# itself differently from its neighbours and break the loader.
-FEATURES = Features(
-    {
-        "audio": Audio(sampling_rate=24000),
-        "audio_file": Value("string"),
-        # Where the clip sits in the dataset's own wavs/ tree, i.e. which
-        # per-episode speaker it came from before linking pooled it here.
-        "source_audio_file": Value("string"),
-        "video_id": Value("string"),
-        "video_url": Value("string"),
-        "title": Value("string"),
-        "channel": Value("string"),
-        "upload_date": Value("string"),
-        "chunk_index": Value("int32"),
-        "start": Value("float64"),
-        "end": Value("float64"),
-        "duration": Value("float64"),
-        "speaker": Value("string"),
-        "global_speaker": Value("string"),
-        "speaker_conf": Value("float64"),
-        "text": Value("string"),
-        "text_source": Value("string"),
-        "text_yt": Value("string"),
-        "text_cohere": Value("string"),
-        "cer_yt_vs_cohere": Value("float64"),
-        "asr_language": Value("string"),
-        "asr_confidence": Value("float64"),
-        # Flattened to a fixed struct: the raw dict is keyed by whichever
-        # languages lost the decode, which is not a stable parquet schema.
-        "asr_confidence_alt": {"ar": Value("float64"), "en": Value("float64")},
-        "align_score": Value("float64"),
-        "aligned_words": Value("int32"),
-        "boundary_clipped": Value("bool"),
-        "vocals_isolated": Value("bool"),
-        "music_score": Value("float64"),
-        "music_label": Value("string"),
-        "speech_score": Value("float64"),
-        "vocal_ratio": Value("float64"),
-        "accompaniment_ratio": Value("float64"),
-        "squim_mos": Value("float64"),
-        "squim_stoi": Value("float64"),
-        "squim_pesq": Value("float64"),
-        "squim_si_sdr": Value("float64"),
-        "snr_db": Value("float64"),
-        "peak_dbfs": Value("float64"),
-        "rms_dbfs": Value("float64"),
-        "clipping_ratio": Value("float64"),
-        "arabic_ratio": Value("float64"),
-        "script_ratio": Value("float64"),
-        "chars_per_sec": Value("float64"),
-        "lufs": Value("float64"),
-        "sample_rate": Value("int32"),
-        "language": Value("string"),
-        # Written by scripts/diacritize.py; null on rows it could not diacritize.
-        "tashkeel_ratio": Value("float64"),
-        "tashkeel_source": Value("string"),
-    }
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from yt2ds import hub_schema  # noqa: E402
+
+FEATURES = hub_schema.features(with_source_audio_file=True)
 SCHEMA = FEATURES.arrow_schema
 COLUMNS = [name for name in SCHEMA.names if name != "audio"]
 
@@ -210,12 +154,8 @@ def build_shard(shard: list[dict], wavs: Path, path: Path, flac: bool) -> None:
             audio.append({"bytes": to_flac(source), "path": f"{Path(name).stem}.flac"})
         else:
             audio.append({"bytes": source.read_bytes(), "path": name})
-        alt = row.get("asr_confidence_alt") or {}
         for column in COLUMNS:
-            if column == "asr_confidence_alt":
-                columns[column].append({"ar": alt.get("ar"), "en": alt.get("en")})
-            else:
-                columns[column].append(row.get(column))
+            columns[column].append(hub_schema.column_value(row, column))
 
     table = pa.Table.from_pydict({"audio": audio, **columns}, schema=SCHEMA)
     pq.write_table(table, path, compression="zstd", compression_level=3)
